@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 import time
+import random
 from datetime import datetime
 import requests
 
@@ -10,6 +11,22 @@ app = Flask(__name__)
 
 # ==================== CONFIG ====================
 API_KEY = "FFG"
+
+# ==================== PROXY LIST ====================
+PROXIES = [
+    {
+        "http": "http://zhzvbrqp:0dyibxc2gqma@31.59.20.176:6754",
+        "https": "http://zhzvbrqp:0dyibxc2gqma@31.59.20.176:6754"
+    },
+    {
+        "http": "http://zhzvbrqp:0dyibxc2gqma@45.38.107.97:6014",
+        "https": "http://zhzvbrqp:0dyibxc2gqma@45.38.107.97:6014"
+    }
+]
+
+def get_random_proxy():
+    """Return a random proxy from the list"""
+    return random.choice(PROXIES)
 
 # ==================== HARDCODED COOKIES ====================
 HARDCODED_COOKIES = {
@@ -67,6 +84,7 @@ class ChatGPT:
         self.sentry_trace = ""
         self.baggage = ""
         self.cookie_status = {}
+        self.current_proxy = None
 
         self.base_url = "https://chatgpt.com"
         self.prepare_path = "/backend-api/f/conversation/prepare"
@@ -96,10 +114,8 @@ class ChatGPT:
         }
         
         cookies = HARDCODED_COOKIES
-        
         self.cookie_status["total"] = len(cookies)
         
-        # Critical check
         critical = {
             "__Secure-next-auth.session-token.0": "has_session_token",
             "cf_clearance": "has_cf_clearance",
@@ -113,7 +129,6 @@ class ChatGPT:
             else:
                 self.cookie_status["missing_critical"].append(cname)
         
-        # Load into session
         for k, v in cookies.items():
             try:
                 self.session.cookies.set(k, v, domain=".chatgpt.com")
@@ -156,6 +171,7 @@ class ChatGPT:
     def _init_session(self):
         self.convo_session_id = str(uuid.uuid4())
         self.turn_trace_id = str(uuid.uuid4())
+        self.current_proxy = get_random_proxy()
 
         # Prepare
         url = f"{self.base_url}{self.prepare_path}"
@@ -186,7 +202,8 @@ class ChatGPT:
             "client_prepare_source": self.payload_config["client_prepare_source"]
         }
         try:
-            r = self.session.post(url, headers=headers, json=prepare_body, timeout=25)
+            r = self.session.post(url, headers=headers, json=prepare_body, 
+                                  timeout=25, proxies=self.current_proxy)
             if r.ok:
                 try:
                     j = r.json()
@@ -205,7 +222,8 @@ class ChatGPT:
             "content-type": "application/json"
         }
         try:
-            r = self.session.post(url2, headers=headers2, json={}, timeout=25)
+            r = self.session.post(url2, headers=headers2, json={}, 
+                                  timeout=25, proxies=self.current_proxy)
             if r.ok:
                 try:
                     j = r.json()
@@ -271,14 +289,27 @@ class ChatGPT:
         if parent_id:
             body["parent_message_id"] = parent_id
 
+        # Try both proxies if one fails
+        proxy_to_use = self.current_proxy or get_random_proxy()
+        
         try:
             r = self.session.post(url, headers=headers, json=body,
-                                  stream=True, timeout=90)
+                                  stream=True, timeout=90, 
+                                  proxies=proxy_to_use)
+            
+            # If 403 with current proxy, try the other proxy
+            if r.status_code == 403 and retry:
+                print(f"[retry] 403 with current proxy, trying other...")
+                # Switch proxy
+                self.current_proxy = [p for p in PROXIES if p != proxy_to_use][0]
+                return self.send_message(text, conversation_id, parent_id, False)
+            
             if r.status_code in (401, 403, 422, 500) and retry:
                 self._init_session()
                 return self.send_message(text, conversation_id, parent_id, False)
+            
             if not r.ok:
-                return None, None, None, None, f"HTTP {r.status_code}: {r.text[:400]}"
+                return None, None, None, None, f"HTTP {r.status_code}: {r.text[:300]}"
         except Exception as e:
             return None, None, None, None, f"Exception: {e}"
 
@@ -331,7 +362,8 @@ def root():
         "endpoints": {
             "ai": "/api/ai?key=FFG&prompt=hi",
             "health": "/api/health",
-            "session": "/api/session"
+            "session": "/api/session",
+            "proxy_test": "/api/proxy-test"
         }
     })
 
@@ -350,8 +382,34 @@ def session_info():
         "cookie_status": gpt.cookie_status,
         "conduit_token": "yes" if gpt.conduit_token else "no",
         "chat_req_token": "yes" if gpt.chat_req_token else "no",
+        "proxy_used": gpt.current_proxy["http"].split("@")[1] if gpt.current_proxy else "none",
         "endpoint": "/api/ai?key=FFG&prompt=hi"
     })
+
+
+@app.route("/api/proxy-test", methods=["GET"])
+def proxy_test():
+    """Test both proxies"""
+    results = []
+    for i, proxy in enumerate(PROXIES):
+        try:
+            r = requests.get("https://chatgpt.com/", timeout=15,
+                           proxies=proxy,
+                           headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            results.append({
+                "proxy": proxy["http"].split("@")[1],
+                "status": r.status_code,
+                "ok": r.status_code == 200,
+                "server": r.headers.get("server", "none")
+            })
+        except Exception as e:
+            results.append({
+                "proxy": proxy["http"].split("@")[1],
+                "error": str(e)[:100],
+                "ok": False
+            })
+    
+    return jsonify({"results": results})
 
 
 @app.route("/api/ai", methods=["GET"])
@@ -375,18 +433,11 @@ def ai_endpoint():
         )
 
         if error:
-            if "401" in str(error) or "Unauthorized" in str(error):
-                return jsonify({
-                    "status": "error",
-                    "message": "Cookies expired. Please refresh cookies in code.",
-                    "cookie_status": gpt.cookie_status,
-                    "reply": None
-                }), 401
-            
             return jsonify({
                 "status": "error",
                 "message": error,
                 "cookie_status": gpt.cookie_status,
+                "proxy_used": gpt.current_proxy["http"].split("@")[1] if gpt.current_proxy else "none",
                 "reply": None
             }), 500
         
@@ -398,7 +449,8 @@ def ai_endpoint():
             "reply": reply,
             "conversation_id": new_cid,
             "parent_id": new_pid,
-            "model": model
+            "model": model,
+            "proxy_used": gpt.current_proxy["http"].split("@")[1] if gpt.current_proxy else "none"
         })
     
     except Exception as e:
