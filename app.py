@@ -1,17 +1,19 @@
+from flask import Flask, request, jsonify
 import json
 import os
 import uuid
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-
 import requests
+
+app = Flask(__name__)
 
 # ==================== CONFIG ====================
 API_KEY = "FFG"
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COOKIES_FILE = os.path.join(BASE_DIR, "cookies.json")
+COOKIES_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "cookies.json"
+)
 
 # ==================== PAYLOAD DEFAULT ====================
 PAYLOAD_CONFIG = {
@@ -46,8 +48,8 @@ class ChatGPT:
         self.turn_trace_id = None
         self.sentry_trace = ""
         self.baggage = ""
+        self.cookie_status = {}
 
-        # Web endpoints (cookies match chatgpt.com)
         self.base_url = "https://chatgpt.com"
         self.prepare_path = "/backend-api/f/conversation/prepare"
         self.sentinel_path = "/backend-api/sentinel/chat-requirements"
@@ -64,15 +66,58 @@ class ChatGPT:
         self._init_session()
 
     def _load_cookies(self):
-        if os.path.exists(COOKIES_FILE):
-            try:
-                with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-                    cookies = json.load(f)
-                for k, v in cookies.items():
+        """Load cookies from cookies.json with validation"""
+        self.cookie_status = {
+            "file_exists": False,
+            "total": 0,
+            "has_session_token": False,
+            "has_cf_clearance": False,
+            "has_oai_sc": False,
+            "has_oai_did": False,
+            "missing_critical": []
+        }
+        
+        if not os.path.exists(COOKIES_FILE):
+            print(f"[cookies] File NOT found: {COOKIES_FILE}")
+            return
+        
+        self.cookie_status["file_exists"] = True
+        
+        try:
+            with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+            
+            self.cookie_status["total"] = len(cookies)
+            
+            # Critical cookies check
+            critical = {
+                "__Secure-next-auth.session-token": "has_session_token",
+                "cf_clearance": "has_cf_clearance",
+                "oai-sc": "has_oai_sc",
+                "oai-did": "has_oai_did"
+            }
+            
+            for cname, cflag in critical.items():
+                if cname in cookies:
+                    self.cookie_status[cflag] = True
+                else:
+                    self.cookie_status["missing_critical"].append(cname)
+            
+            # Load all cookies into session
+            for k, v in cookies.items():
+                try:
                     self.session.cookies.set(k, v, domain=".chatgpt.com")
                     self.session.cookies.set(k, v, domain="chatgpt.com")
-            except Exception as e:
-                print(f"[cookies] {e}")
+                    self.session.cookies.set(k, v, domain="chat.openai.com")
+                except Exception:
+                    pass
+            
+            print(f"[cookies] Loaded {len(cookies)} cookies")
+            if self.cookie_status["missing_critical"]:
+                print(f"[cookies] MISSING: {self.cookie_status['missing_critical']}")
+        
+        except Exception as e:
+            print(f"[cookies] Error: {e}")
 
     def _generate_sentry(self):
         tid = uuid.uuid4().hex
@@ -272,109 +317,88 @@ class ChatGPT:
         return full_text, new_conv, new_parent, model_used, None
 
 
-# ==================== VERCEL HANDLER ====================
-class handler(BaseHTTPRequestHandler):
+# ==================== ROUTES ====================
 
-    def _json(self, code, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-        self.wfile.write(body)
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "status": "ok",
+        "message": "ChatGPT API running",
+        "endpoints": {
+            "ai": "/api/ai?key=FFG&prompt=hi",
+            "health": "/api/health",
+            "session": "/api/session"
+        }
+    })
 
-    def do_OPTIONS(self):
-        self._json(200, {"status": "ok"})
 
-    def do_GET(self):
-        try:
-            parsed = urlparse(self.path)
-            params = parse_qs(parsed.query)
-            path = parsed.path.rstrip("/")
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
 
-            # Health check
-            if path.endswith("/health"):
-                self._json(200, {
-                    "status": "ok",
-                    "message": "API is running",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                return
 
-            # Session info
-            if path.endswith("/session"):
-                self._json(200, {
-                    "status": "ok",
-                    "cookies_loaded": os.path.exists(COOKIES_FILE),
-                    "endpoint": "/api/ai?key=FFG&prompt=hi"
-                })
-                return
+@app.route("/api/session", methods=["GET"])
+def session_info():
+    """Show cookie status - useful for debugging"""
+    gpt = ChatGPT()
+    return jsonify({
+        "status": "ok",
+        "cookies_file": COOKIES_FILE,
+        "cookies_file_exists": os.path.exists(COOKIES_FILE),
+        "cookie_status": gpt.cookie_status,
+        "conduit_token": "yes" if gpt.conduit_token else "no",
+        "chat_req_token": "yes" if gpt.chat_req_token else "no",
+        "endpoint": "/api/ai?key=FFG&prompt=hi"
+    })
 
-            # Main AI endpoint
-            api_key = params.get("key", [""])[0].strip()
-            prompt = params.get("prompt", [""])[0].strip()
-            conversation_id = params.get("conversation_id", [None])[0]
-            parent_id = params.get("parent_id", [None])[0]
 
-            if not api_key:
-                self._json(401, {
+@app.route("/api/ai", methods=["GET"])
+def ai_endpoint():
+    api_key = request.args.get("key", "").strip()
+    prompt = request.args.get("prompt", "").strip()
+    conversation_id = request.args.get("conversation_id", None)
+    parent_id = request.args.get("parent_id", None)
+
+    if not api_key:
+        return jsonify({"status": "error", "message": "Missing key", "reply": None}), 401
+    if api_key != API_KEY:
+        return jsonify({"status": "error", "message": "Invalid key", "reply": None}), 403
+    if not prompt:
+        return jsonify({"status": "error", "message": "Missing prompt", "reply": None}), 400
+
+    try:
+        gpt = ChatGPT()
+        reply, new_cid, new_pid, model, error = gpt.send_message(
+            prompt, conversation_id, parent_id
+        )
+
+        if error:
+            # Agar 401 hai toh cookie issue hai
+            if "401" in str(error) or "Unauthorized" in str(error):
+                return jsonify({
                     "status": "error",
-                    "message": "Missing API key. Use ?key=FFG",
+                    "message": "Cookies expired or invalid. Please refresh cookies.json",
+                    "cookie_status": gpt.cookie_status,
                     "reply": None
-                })
-                return
-
-            if api_key != API_KEY:
-                self._json(403, {
-                    "status": "error",
-                    "message": "Invalid API key",
-                    "reply": None
-                })
-                return
-
-            if not prompt:
-                self._json(400, {
-                    "status": "error",
-                    "message": "Missing prompt. Use ?prompt=YOUR_MESSAGE",
-                    "reply": None
-                })
-                return
-
-            gpt = ChatGPT()
-            reply, new_cid, new_pid, model, error = gpt.send_message(
-                prompt, conversation_id, parent_id
-            )
-
-            if error:
-                self._json(500, {
-                    "status": "error",
-                    "message": error,
-                    "reply": None
-                })
-                return
-
-            if not reply:
-                self._json(500, {
-                    "status": "error",
-                    "message": "No response received from ChatGPT",
-                    "reply": None
-                })
-                return
-
-            self._json(200, {
-                "status": "success",
-                "reply": reply,
-                "conversation_id": new_cid,
-                "parent_id": new_pid,
-                "model": model
-            })
-
-        except Exception as e:
-            self._json(500, {
+                }), 401
+            
+            return jsonify({
                 "status": "error",
-                "message": f"Internal error: {str(e)}",
+                "message": error,
+                "cookie_status": gpt.cookie_status,
                 "reply": None
-            })
+            }), 500
+        
+        if not reply:
+            return jsonify({"status": "error", "message": "No response", "reply": None}), 500
+
+        return jsonify({
+            "status": "success",
+            "reply": reply,
+            "conversation_id": new_cid,
+            "parent_id": new_pid,
+            "model": model
+        })
+    
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e), "reply": None}), 500
