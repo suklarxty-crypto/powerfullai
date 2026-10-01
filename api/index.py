@@ -1,17 +1,18 @@
+from flask import Flask, request, jsonify
 import json
 import os
 import uuid
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-
 import requests
+
+app = Flask(__name__)
 
 # ==================== CONFIG ====================
 API_KEY = "FFG"
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COOKIES_FILE = os.path.join(BASE_DIR, "cookies.json")
+
+# Cookies file - API folder ke bahar root me
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.json")
 
 # ==================== PAYLOAD DEFAULT ====================
 PAYLOAD_CONFIG = {
@@ -38,7 +39,7 @@ class ChatGPT:
     def __init__(self):
         self.session = requests.Session()
         self.payload_config = PAYLOAD_CONFIG.copy()
-        self.device_id = None
+        self.device_id = str(uuid.uuid4())
         self.conduit_token = ""
         self.chat_req_token = ""
         self.play_integrity_token = ""
@@ -47,7 +48,6 @@ class ChatGPT:
         self.sentry_trace = ""
         self.baggage = ""
 
-        # Web endpoints (cookies match chatgpt.com)
         self.base_url = "https://chatgpt.com"
         self.prepare_path = "/backend-api/f/conversation/prepare"
         self.sentinel_path = "/backend-api/sentinel/chat-requirements"
@@ -60,7 +60,6 @@ class ChatGPT:
         self.timezone_offset = -180
 
         self._load_cookies()
-        self.device_id = str(uuid.uuid4())
         self._init_session()
 
     def _load_cookies(self):
@@ -272,109 +271,53 @@ class ChatGPT:
         return full_text, new_conv, new_parent, model_used, None
 
 
-# ==================== VERCEL HANDLER ====================
-class handler(BaseHTTPRequestHandler):
+# ==================== ROUTES ====================
 
-    def _json(self, code, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-        self.wfile.write(body)
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "status": "ok",
+        "message": "ChatGPT API running",
+        "endpoint": "/api/ai?key=FFG&prompt=hi"
+    })
 
-    def do_OPTIONS(self):
-        self._json(200, {"status": "ok"})
 
-    def do_GET(self):
-        try:
-            parsed = urlparse(self.path)
-            params = parse_qs(parsed.query)
-            path = parsed.path.rstrip("/")
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
 
-            # Health check
-            if path.endswith("/health"):
-                self._json(200, {
-                    "status": "ok",
-                    "message": "API is running",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                return
 
-            # Session info
-            if path.endswith("/session"):
-                self._json(200, {
-                    "status": "ok",
-                    "cookies_loaded": os.path.exists(COOKIES_FILE),
-                    "endpoint": "/api/ai?key=FFG&prompt=hi"
-                })
-                return
+@app.route("/api/ai", methods=["GET"])
+def ai_endpoint():
+    api_key = request.args.get("key", "").strip()
+    prompt = request.args.get("prompt", "").strip()
+    conversation_id = request.args.get("conversation_id", None)
+    parent_id = request.args.get("parent_id", None)
 
-            # Main AI endpoint
-            api_key = params.get("key", [""])[0].strip()
-            prompt = params.get("prompt", [""])[0].strip()
-            conversation_id = params.get("conversation_id", [None])[0]
-            parent_id = params.get("parent_id", [None])[0]
+    if not api_key:
+        return jsonify({"status": "error", "message": "Missing key", "reply": None}), 401
+    if api_key != API_KEY:
+        return jsonify({"status": "error", "message": "Invalid key", "reply": None}), 403
+    if not prompt:
+        return jsonify({"status": "error", "message": "Missing prompt", "reply": None}), 400
 
-            if not api_key:
-                self._json(401, {
-                    "status": "error",
-                    "message": "Missing API key. Use ?key=FFG",
-                    "reply": None
-                })
-                return
+    try:
+        gpt = ChatGPT()
+        reply, new_cid, new_pid, model, error = gpt.send_message(
+            prompt, conversation_id, parent_id
+        )
 
-            if api_key != API_KEY:
-                self._json(403, {
-                    "status": "error",
-                    "message": "Invalid API key",
-                    "reply": None
-                })
-                return
+        if error:
+            return jsonify({"status": "error", "message": error, "reply": None}), 500
+        if not reply:
+            return jsonify({"status": "error", "message": "No response", "reply": None}), 500
 
-            if not prompt:
-                self._json(400, {
-                    "status": "error",
-                    "message": "Missing prompt. Use ?prompt=YOUR_MESSAGE",
-                    "reply": None
-                })
-                return
-
-            gpt = ChatGPT()
-            reply, new_cid, new_pid, model, error = gpt.send_message(
-                prompt, conversation_id, parent_id
-            )
-
-            if error:
-                self._json(500, {
-                    "status": "error",
-                    "message": error,
-                    "reply": None
-                })
-                return
-
-            if not reply:
-                self._json(500, {
-                    "status": "error",
-                    "message": "No response received from ChatGPT",
-                    "reply": None
-                })
-                return
-
-            self._json(200, {
-                "status": "success",
-                "reply": reply,
-                "conversation_id": new_cid,
-                "parent_id": new_pid,
-                "model": model
-            })
-
-        except Exception as e:
-            self._json(500, {
-                "status": "error",
-                "message": f"Internal error: {str(e)}",
-                "reply": None
-            })
+        return jsonify({
+            "status": "success",
+            "reply": reply,
+            "conversation_id": new_cid,
+            "parent_id": new_pid,
+            "model": model
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e), "reply": None}), 500
