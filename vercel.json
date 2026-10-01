@@ -1,11 +1,19 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" }
+    {
+      "src": "api/ai.py",
+      "use": "@vercel/python"
+    }
   ],
   "routes": [
-    { "src": "/api/ai", "dest": "api/index.py" },
-    { "src": "/api/health", "dest": "api/index.py" },
-    { "src": "/api/session", "dest": "api/index.py" }
+    {
+      "src": "/api/ai",
+      "dest": "api/ai.py"
+    },
+    {
+      "src": "/api/health",
+      "dest": "api/ai.py"
+    }
   ]
 }
