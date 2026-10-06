@@ -1,457 +1,1728 @@
-from flask import Flask, request, jsonify
+# app.py — Instagram Profile API v25
+# TopSearch (3 retries) + Deep DOM (wait for header) | NO web_profile_info
+# 4s API timeout | 40s page timeout | Fast + Reliable
+
+import asyncio
+import gc
+import hashlib
 import json
 import os
-import uuid
-import time
 import random
-from datetime import datetime
-import requests
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, List, Any
+from urllib.parse import unquote
 
-app = Flask(__name__)
+from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+
+try:
+    from playwright.async_api import (
+        async_playwright, Browser, BrowserContext, Page, Route,
+        TimeoutError as PlaywrightTimeout,
+    )
+except ImportError:
+    sys.exit("playwright required:  pip install playwright && playwright install chromium")
+
+try:
+    from faker import Faker
+except ImportError:
+    sys.exit("faker required:  pip install faker")
+
+import numpy as np
+
 
 # ==================== CONFIG ====================
-API_KEY = "FFG"
+HEADLESS         = True
+SLOW_MO          = 0
+PAGE_TIMEOUT     = 40_000
+API_TIMEOUT      = 4.0
+HOMEPAGE_TIMEOUT = 10_000
+HEADER_WAIT      = 10_000
+COOKIE_FILE      = Path(os.getenv("COOKIE_FILE", "dxm.txt"))
+PROXY_FILE       = Path(os.getenv("PROXY_FILE", "proxy.txt"))
+CACHE_DIR        = Path(os.getenv("CACHE_DIR", "/tmp/ig_cache"))
+CACHE_TTL_MIN    = int(os.getenv("CACHE_TTL_MIN", "120"))
+PROXY_ENABLED    = os.getenv("PROXY_ENABLED", "true").lower() == "true"
 
-# ==================== PROXY LIST ====================
-PROXIES = [
-    {
-        "http": "http://zhzvbrqp:0dyibxc2gqma@31.59.20.176:6754",
-        "https": "http://zhzvbrqp:0dyibxc2gqma@31.59.20.176:6754"
-    },
-    {
-        "http": "http://zhzvbrqp:0dyibxc2gqma@45.38.107.97:6014",
-        "https": "http://zhzvbrqp:0dyibxc2gqma@45.38.107.97:6014"
-    }
+MAX_CONCURRENT_BROWSERS = int(os.getenv("MAX_CONCURRENT_BROWSERS", "1"))
+BROWSER_RECYCLE_AFTER   = int(os.getenv("BROWSER_RECYCLE_AFTER", "20"))
+GC_AGGRESSIVE           = os.getenv("GC_AGGRESSIVE", "true").lower() == "true"
+
+VALID_KEYS = {"ANSHPAPA": "full_access", "FF": "full_access"}
+HEALTH_KEY = os.getenv("HEALTH_KEY", "ANSHPAPA")
+
+
+fake = Faker()
+rng  = np.random.default_rng()
+
+CHROMIUM_ARGS = [
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+    "--disable-gpu", "--disable-software-rasterizer",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process,TranslateUI,BlinkGenPropertyTrees,CalculateNativeWinOcclusion,AutomationControlled",
+    "--disable-background-networking", "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+    "--disable-ipc-flooding-protection", "--disable-default-apps", "--disable-sync",
+    "--disable-translate", "--disable-extensions", "--disable-plugins-discovery",
+    "--disable-component-update", "--disable-domain-reliability",
+    "--disable-client-side-phishing-detection", "--disable-hang-monitor",
+    "--disable-popup-blocking", "--disable-prompt-on-repost", "--metrics-recording-only",
+    "--no-first-run", "--no-default-browser-check", "--mute-audio", "--hide-scrollbars",
+    "--window-size=1366,768", "--memory-pressure-off", "--disable-dev-tools",
+    "--js-flags=--max-old-space-size=128", "--renderer-process-limit=1",
+    "--disk-cache-size=1", "--media-cache-size=1", "--disable-logging",
+    "--silent-debugger-extension-api", "--force-color-profile=srgb",
+    "--disable-accelerated-2d-canvas",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
 ]
 
-def get_random_proxy():
-    """Return a random proxy from the list"""
-    return random.choice(PROXIES)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
 
-# ==================== HARDCODED COOKIES ====================
-HARDCODED_COOKIES = {
-    "oai-did": "57496d26-4a2a-4bd6-904f-888cdeaf7a77",
-    "oai-mweb-route-desktop": "1",
-    "oai-hlib": "true",
-    "oai-client-session-epoch": "0272ac00-bef2-4e38-b906-5fe31b992bd9",
-    "_account": "0a4f2a28-ef02-40c6-ad0f-980ba33d6e8f",
-    "oai-sc": "0gAAAAABqvlW5e5gYnmyaouWgIF2CfKQ3VzvjS7HubhTrUUF4Uqdhn-1UcRSTHOD7vYIzMdRwNEoR8CCs-rwawVMWgKKdu7_6yD360z57qePMshp8DFZ_jNJ2pdJNi4ZDHm2CU9xxp1wW5_SVeW6teKGgJjCFwU6g9jKa8VlaWU1S5HmyTyBG47EK9lukL9C9yVq1BPBkX9cQpl1EHsmDtvHabzZMWMs5TunnN0q3K5CHPSWfbs2_L38",
-    "__Secure-next-auth.session-token.0": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..G8GO3Bnh2gW4pTN8.525JGm4oYuLu3cx0YGkbsf4z1bJ2lzkRt90keBAsLOGLpH0FJ5IY-aoafr_bqJRngd0di4_sZyZpGEC-XrH2i7TnssJU7rnEPzgr633njCvq9F92PIMSAlwNh7MK5RgBwpOmwWZ_wqporYcXa5ywe_VGWCWFdM-fyoSxP3juCx03wl44QjzTNyBRxip19nqB0Ir9eKIob1N7K7vgtZPubRPzK-248ZqtSh40mHP1JCyOMVOpWKG6HKCUQijHJ8rsoRajDDiLp7354A7irDcQcbkvK9ca73TuwKGa9azf_D0eTC8NlFoQoK4ERsvpIYI00j3P6CSVMisuOA1DzHqvjL3Uy6X4QPORq9hVs3PVH8thHO5RXGoUVI2cU1OAxbQVmaTIzapOUGp2xZyMig1mEJN165kubynKsEXnK4wQMnhKHa6g8fxBlqomRBQhMbntd7qqfTY53ZGVat4gmNufK35KjBlir_0F41fACTqVUAkyS2PjQ63Gwx3pHKanNMKsXrUI_pOYkGFjBfrenHI3m3YuVPvCubOYtus_tkpn5rAcx2DN52U0HkZ7kr4CR7ehWR0Doe6kE8g5Dl1mVspijwVs2cDrc7hWhOurZaIRWD75j0jPgDSDVTJ-6DWD47pTyqeP2NbJk4lq-0f-7P2F_4x4eksHMxnNXm-6AOXv8vLcdU8EkJPG8Hfed8ykozmd0QFDShKmb01BcMfsp7ngTuknJ7ka6xdKGGuB_DS421gK5KdY7QlNHQzSVDVT0TPEpcgUUTGHCAh81sMT0zA0WsaTHrJJdQsPfqG85Mj5OP_lDWIvg2saCM_4_nvfpGCsLU7W3SqU0jiQrX3UAAx3_-okxAbBcCqx59c2K0kadYgrEXsY6fJmnICdLTDjU4fRGBBFX_sMTzKjeb92Y3Hq16CjQFNcalYPQ2L2CYF8a6JaOoVsLxR2FY32p-FWVdMB6annx0ygIkAQVEMmcrwYC-WCE_tnuSx0Cr_s7BP37DhTJP9UaJTfcNqozxLAU6vq4yAZWo-7f3d3nDpDmdWjNp1gA1u-OeqUKiK6Ov4EEAvzRXn1yIjqswmWJZ_m1jmVyi0QrfiA96Nf9rSqanF2s7BtaIVooeMma0iriN-ofmt-D3kYZeQJoRFGdyr1vUAnX2mWTq91vSG5UPstV76aL6zsyFetFRpsfXo6WmKgwGCK9Re1wg2DquIeGTJMakRzTKYlJ8KcHhJOlIP3yKmyaUWBwIOMm1B6JJYJYiAXEsVm3fsmUTs7nhf9y5OnytH3TMAWoYM3_pDizS8nra5z1Eq_7XOz-ArBo1uk0Eow1P1lhlva3mhQ3djele63qBQxn4KlD6juJ2toHFAW_KozZbFbsCHSM8iHVvMEgPkRKAzN4sc9dPLn3HLkbPug8GAzriWiyGNyfHBXr4CglbxqpuROQ-nhpi_XX18n5sAeoimyIUBP9OeMXQc2c8wwVM3BMH7zcEveXCnZpg-xD3L3xwQUplS0T-b2t1wFtHJZkmbyk6ozI6nYa_zlQzuy7K7v4lJoMeOjS4lCNpfj6U8dmJ88X2M64xLgCVf5Z34o3Kw-ymLiIm5Moie4UMfvDLuK5WOpaIzqHE9_v02ar6xR-XK8q8t0r8lEQSZm9szM8CFJ9kXLQGHrkx7jazrIdUjQ1IQEgdqi2SxX0tgzNkvPk0UZzbvSAPUxcH_zrjvXS2dnsrxeBbUIeBf40y_6LaO08FUuvGLyRissp7hgRurh9AW_b1IVm0w8XBtNtNz_Q0Og2BpdALyAmtNEZwYReyt3mPQORNEH01qlzLpHCZrQdGoAmzYLgLzeT6amcw63Fo5eMflShl5mfBMO70LdGEsbnG3VxfKUwhNBC7S1BZ7oKH9riXe5Fi3_6JAxhcIYiK0FaJTgG8UDqJSRFA7Ik1fRVCuRj80J6WuaKzDUaexT8oaqz2ztL4piBwEjssAmWjNPn5bICCafU_xHIbb6X3mYuaq-InciTBzbaoZqOGEtVqx5ZbGRw8ZCAMLYlOlO_JEw4_yRF1u3Mv-vuS4E7Su6Es_ja8TLXCogPZpzJ0FTcEpvHL1BZbTZoJs4uGrB6GeHdHU9R8GFCNfG-uBEFuqEskVQ3j4Fd4k9t6qbW44ROnRhxcDCGoYPAJa-Sh2w2VrrqI7_n4xqcAmnGSz0-2lRqN-yo2L_XeKKF89GZ0feQ2pPahPVoPf0PqJHavDZxulSvRLx95kiTUC8zCYt3b4NYRFV-yMahNZuA7owI7SaVBtxzP9XFFqsjt3dVKYJ2Nt1vxed0LZR6AQF-_hAzr5zRnH3VHJZRWuj-shP8ldDB0ujY7C1lg2XQz2PVz5PokfJYuBffKKcYG7HjCHr-20pGUeFQQiVmFkgMKvgPQB7pzGdTzrUoF-PAu7KCiqLxyiodbi_w-DlRPklbsRU3UUPKKOomzJXV79sRyj2DqnmuIMrLrI3EeYuBe1yq3YVgO9LML-cSOkmVb3WLhTIuXGMzdPhASrDq7gL_YsxkQY0WsDOxF2liuBy1v6aDktak_y0SUJ7p2wvuwYeQbPGZRsQjtwy0JzdahBsQbLr_WalN2ZbtGUemVVZiKgNz5HySs07A3wA1oOUJPRqt5NbYXbP14EXq-ZcnPoFwl5zv-MssYvck4a63Xdjn5Z-Zizuk7BbYDiCNI6Ip9kwV3Uq6bLAQTvsbwOrJaiwIV4ZMjRsYUPsIJKkoPAIrjqjwJq0bbul0EUJBHR2S17KbocXTAlFqW0Ap_YpAuz99lVPlSycDpenDf69f2fa7ehIZjB_5zcPOMJft1SQigvi_KLuVmgBTEhfDjilv0gkRBVZieFpe0kkRBw_UyvYyzpGPz_txslH2ZtR9sugpwDf80xvKObxS2P_Io6bslNLDTkNvX0YIgUJF3iR7nARPasfZNafeMcU3HQ0G7D5CJKkLSutZBmIeBFFMGJo7zHNTiY_p81MYM9rY6sF-Hn8RsScWyqVW5nu3OmV57kQ0IlZDw5TLP6rqM-2riIGahKzw5Wrlm7TCEW08ulwqMU2WGkPb4XbNAjdNct7E7g572629fY2UONMPz83LLWy53zecLdCx1vZSaXIPrRoDB3Q1QxviaAp_yvnD1Ewwmyd6t11-MeRsCHCZ7_yj6lcUMgyeixXod61wUSua8PExIP5cfzyWn_hKQR1U4Mow4f2GwZ2OFh4-jJCrC-vwUQ3X6rPqon1px3ng6o_B3XdAAIOcEwAOkQB6QF-dNP_BgsfGwQd17LMI5L_oOh8q4UfqcSVMtOArOg-LJhB0AmW4_BpU7A5j6od5I_6VT0jaj3H1obtLrwT6rY-IYOxkf4EOQi4RJvcVzjqa8-HbhYnVxU9tIw1BQB4D3kLMX3D86isQvWrNnjxi5zC_TMC9S1iC_J7ZpVnNum1L0ypz7GNr1jwXoV-0f7NapVXtnbEainENuBKWd2Ny4HI96vyKQdFwoDTwgYMSs4BuZ0j4gm-fl9UR32cu9sPpCePqyfbVRwZXAsnQg-USjgViMGZXLi6hcR5ma2gQPgXeiGLscP-9QTxghC6pdF6AWh6DbOPNtg5l028n9JI32mFz01Azwz8G_n-xXGgDxgr_ayf3F6psQbPnyi95jo0IBGofzHMgOQfPqwf4_UTS_dFgyhTNPsvsn4dsqsrZlHwOH83oZ4DhjzgvVpksAoX7vfRB8yNOR5WLmR_ApHycx_MMVI2zyXZ0DW45OS1L_vzIj5Q9EDCd8lT6KEAz1lP8mNvBcSD_SMrvVbQSYmnOHDyx2enmwTsCIPRvNkfI8OJXolm7ZMLPBvoId-_KUhT0jO_aNpi8mGlicrbhWPWHzwV_RfsdSq3Qf61cn7qF9JSJ_mv9_u4bvtpOhq",
-    "__Secure-next-auth.session-token.1": "2Gee5LwnYA-QP9paJ-qCEBbmA3qevut0JYOIxV6brDPPAhlLTWIROaQM.eOgY3qVBvUuORQesJc6mdg",
-    "cf_clearance": "bcg3aaz8Sgbx2tQrlbpDYagpLATp_RA01_lXe_Z.I7s-1790857271-1.2.1.1-uRLBGZXmOBBGN5q3.o5xI4s51vFN1UjFC3eAYzZPjEw8shfAtmXdj4LGUTlNljXhmNVkDWLWJeM4N8tP8pWqDhn6X4IAfcAt5UENom.yfiqRt4hzX36Ew3foW4n0nJDayWjibgaRumnGxPITa8xK4dghJvSO..kLBYTqImwQ4lDTftrlccd23GN6aNgS.Wyr6VF.675g3V.Qho1X1X2tXi7DvJNDRLbp7x_RRL_1q4qvi_zRCEzBUFIYk8a8CoE.JCxRmFhhppNqHNkI1epaE12_UiCfdprx0rcv9hyTXTM7T68upuYvqf_VsZcEveVgiSbSg_Iqp0hW91tJdX9MB0MtteHaH8f0F9i4kVotCIg",
-    "_dd_s_v2": "aid=f57c82a6-10db-4c27-8321-e391df5d5c37&id=26aea063-46ee-46fb-b195-12cd0d01f75b&created=1790857265683&expire=1790859602184&c=0",
-    "__cf_bm": "cZKQLSJlfaKwvnrU_nQQ5T2ocLx8AILUK_Hls_IQLS0-1790859135.5820725-1.0.1.1-plNq3oTKBls8d_.MqHZJedisPylY3XIO72JLL3p38hP8Iox60RJSJezP2BlsugLtOvvLOjG0XzUEo3lckErkaw35IefPYk9etNa602NbO91w_BVpHnBuQ5a7uPWtjIss",
-    "__Secure-next-auth.callback-url": "https%3A%2F%2Fchatgpt.com%2F",
-    "__Host-next-auth.csrf-token": "64e8ff4cd0920cb5324e91bb95c7ae39836d541051f45dee2ffe360fb1dfeb97%7Ce3be8299677dedfa555f24451eaeefbdd92d707be7aec1d559fc8aa312314e86",
-    "__cflb": "0H28vzvP5FJafnkHxjEtGkoEyvgGZvmfxuYw3j8GmZd",
-    "_cfuvid": "y71bJy3AeZCNed0yaFs4EJFdBI7U1Uij.jhKFAwJBLI-1790857256.8821173-1.0.1.1-_D4nbu1ayYuPOxZDwOcUkdl4G500H1T6W8CYYqvjHcU",
-    "oai_pl_permission_state": "disabled",
-    "_rdt_uuid": "1790513080591.e3b3e04a-f1ec-4e28-99a5-84bb0d24fe8c",
-    "codex_sidebar_width": "340"
-}
+IG_APP_ID = "936619743392459"
 
-# ==================== PAYLOAD DEFAULT ====================
-PAYLOAD_CONFIG = {
-    "model": "auto",
-    "history_and_training_disabled": False,
-    "enable_message_followups": True,
-    "force_use_sse": True,
-    "force_use_search": None,
-    "force_paragen": False,
-    "supports_buffering": False,
-    "timezone": "Africa/Cairo",
-    "timezone_offset_min": -180,
-    "system_hints": [],
-    "is_onboarding_conversation": False,
-    "no_auth_ad_preferences": {"personalization_enabled": False, "history_enabled": True},
-    "client_prepare_dispatch": "debounced",
-    "client_prepare_source": "composer_editor_state",
-    "client_prepare_state": "success"
-}
+SERVER_START_TIME = time.time()
+REQUEST_COUNTER = {"total": 0, "success": 0, "failed": 0, "cached": 0}
+LAST_SCRAPE = {"time": None, "username": None, "duration": None, "source": None}
 
 
-# ==================== CHATGPT CLASS ====================
-class ChatGPT:
+# ============================================================================
+# BROWSER POOL
+# ============================================================================
+class BrowserPool:
     def __init__(self):
-        self.session = requests.Session()
-        self.payload_config = PAYLOAD_CONFIG.copy()
-        self.device_id = None
-        self.conduit_token = ""
-        self.chat_req_token = ""
-        self.play_integrity_token = ""
-        self.convo_session_id = None
-        self.turn_trace_id = None
-        self.sentry_trace = ""
-        self.baggage = ""
-        self.cookie_status = {}
-        self.current_proxy = None
+        self._pw = None
+        self._browser: Optional[Browser] = None
+        self._lock = asyncio.Lock()
+        self._context_count = 0
+        self._total_recycles = 0
+        self._started = False
+        self._start_time = None
 
-        self.base_url = "https://chatgpt.com"
-        self.prepare_path = "/backend-api/f/conversation/prepare"
-        self.sentinel_path = "/backend-api/sentinel/chat-requirements"
-        self.conversation_path = "/backend-api/f/conversation"
-        self.user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/131.0.0.0 Safari/537.36")
-        self.accept_language = "en-US,en;q=0.9"
-        self.timezone = "Africa/Cairo"
-        self.timezone_offset = -180
+    async def start(self):
+        if self._started: return
+        async with self._lock:
+            if self._started: return
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(
+                headless=HEADLESS, slow_mo=SLOW_MO, args=CHROMIUM_ARGS,
+            )
+            self._started = True
+            self._start_time = time.time()
+            print("[pool] browser started")
 
-        self._load_cookies()
-        self.device_id = str(uuid.uuid4())
-        self._init_session()
+    async def acquire_browser(self) -> Browser:
+        if not self._started:
+            await self.start()
+        async with self._lock:
+            if self._context_count >= BROWSER_RECYCLE_AFTER:
+                print(f"[pool] recycling after {self._context_count} contexts")
+                try: await self._browser.close()
+                except Exception: pass
+                self._browser = await self._pw.chromium.launch(
+                    headless=HEADLESS, slow_mo=SLOW_MO, args=CHROMIUM_ARGS,
+                )
+                self._context_count = 0
+                self._total_recycles += 1
+                self._start_time = time.time()
+                if GC_AGGRESSIVE: gc.collect()
+            self._context_count += 1
+            return self._browser
 
-    def _load_cookies(self):
-        """Load hardcoded cookies"""
-        self.cookie_status = {
-            "total": 0,
-            "has_session_token": False,
-            "has_cf_clearance": False,
-            "has_oai_sc": False,
-            "has_oai_did": False,
-            "missing_critical": [],
-            "source": "hardcoded"
-        }
-        
-        cookies = HARDCODED_COOKIES
-        self.cookie_status["total"] = len(cookies)
-        
-        critical = {
-            "__Secure-next-auth.session-token.0": "has_session_token",
-            "cf_clearance": "has_cf_clearance",
-            "oai-sc": "has_oai_sc",
-            "oai-did": "has_oai_did"
-        }
-        
-        for cname, cflag in critical.items():
-            if cname in cookies:
-                self.cookie_status[cflag] = True
-            else:
-                self.cookie_status["missing_critical"].append(cname)
-        
-        for k, v in cookies.items():
-            try:
-                self.session.cookies.set(k, v, domain=".chatgpt.com")
-                self.session.cookies.set(k, v, domain="chatgpt.com")
-            except Exception:
-                pass
-        
-        print(f"[cookies] Loaded {len(cookies)} hardcoded cookies")
+    async def shutdown(self):
+        if self._browser:
+            try: await self._browser.close()
+            except Exception: pass
+        if self._pw:
+            try: await self._pw.stop()
+            except Exception: pass
+        self._started = False
+        print("[pool] shutdown complete")
 
-    def _generate_sentry(self):
-        tid = uuid.uuid4().hex
-        self.sentry_trace = f"{tid[:16]}-{tid[16:32]}"
-        self.baggage = (
-            f"sentry-environment=production,sentry-org_id=33249,"
-            f"sentry-public_key=6884768431e4ba548d58cbf3ad96e4ce,"
-            f"sentry-release=com.openai.chatgpt%401.2026.195%2B2619512,"
-            f"sentry-sample_rand=0.{int(time.time()*1000)%1000000},"
-            f"sentry-trace_id={tid[:16]}"
-        )
-
-    def _common_headers(self):
-        self._generate_sentry()
+    def stats(self):
         return {
-            "user-agent": self.user_agent,
-            "accept-language": self.accept_language,
-            "accept": "application/json",
-            "sentry-trace": self.sentry_trace,
-            "baggage": self.baggage,
-            "origin": "https://chatgpt.com",
-            "referer": "https://chatgpt.com/",
-            "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "accept-encoding": "gzip, deflate, br"
+            "started": self._started,
+            "context_count": self._context_count,
+            "total_recycles": self._total_recycles,
+            "uptime_seconds": round(time.time() - self._start_time, 2) if self._start_time else 0,
         }
 
-    def _init_session(self):
-        self.convo_session_id = str(uuid.uuid4())
-        self.turn_trace_id = str(uuid.uuid4())
-        self.current_proxy = get_random_proxy()
 
-        # Prepare
-        url = f"{self.base_url}{self.prepare_path}"
-        headers = {
-            **self._common_headers(),
-            "x-oai-convo-session-id": self.convo_session_id,
-            "x-oai-turn-trace-id": self.turn_trace_id,
-            "x-conduit-token": self.conduit_token or "",
-            "x-openai-target-path": self.prepare_path,
-            "content-type": "application/json"
+BROWSER_POOL = BrowserPool()
+BROWSER_SEM = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
+
+
+# ============================================================================
+# PROXY POOL
+# ============================================================================
+class ProxyPool:
+    def __init__(self):
+        self.entries: List[Dict] = []
+        self._recent: List[int] = []
+        self._cooldown: Dict[int, float] = {}
+        self._use_count: Dict[int, int] = {}
+        self.load()
+
+    def load(self):
+        self.entries = []
+        if not PROXY_ENABLED: return
+        if not PROXY_FILE.exists():
+            print(f"[proxy] {PROXY_FILE} not found — direct")
+            return
+        for raw in PROXY_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"): continue
+            p = self._parse(line)
+            if p: self.entries.append(p)
+        for i, e in enumerate(self.entries):
+            self._use_count[i] = 0
+            print(f"[proxy] {e['server']}")
+
+    @staticmethod
+    def _parse(line: str) -> Optional[Dict]:
+        m = re.match(r"^(https?://)?([^:@/\s]+):([^@/\s]+)@([^:/\s]+):(\d+)$", line)
+        if m:
+            s, u, pw, h, p = m.groups()
+            return {"server": f"{s or 'http://'}{h}:{p}", "username": u, "password": pw}
+        m = re.match(r"^([^:\s]+):(\d+):([^:\s]+):(.+)$", line)
+        if m:
+            h, p, u, pw = m.groups()
+            return {"server": f"http://{h}:{p}", "username": u, "password": pw.strip()}
+        m = re.match(r"^(https?://)?([^:/\s]+):(\d+)$", line)
+        if m:
+            s, h, p = m.groups()
+            return {"server": f"{s or 'http://'}{h}:{p}"}
+        return None
+
+    def next(self) -> Optional[Dict]:
+        if not self.entries: return None
+        n = len(self.entries)
+        now = time.time()
+        self._cooldown = {i: t for i, t in self._cooldown.items() if now - t < 45}
+        available = [i for i in range(n) if i not in self._recent and i not in self._cooldown]
+        if not available:
+            available = [i for i in range(n) if i not in self._cooldown]
+        if not available:
+            available = list(range(n))
+        idx = random.choice(available)
+        self._recent.append(idx)
+        if len(self._recent) > min(3, max(1, n - 1)):
+            self._recent.pop(0)
+        self._cooldown[idx] = now
+        self._use_count[idx] = self._use_count.get(idx, 0) + 1
+        return self.entries[idx]
+
+    def size(self): return len(self.entries)
+
+    def stats(self):
+        return {
+            "total": len(self.entries),
+            "enabled": PROXY_ENABLED,
+            "in_cooldown": len(self._cooldown),
+            "usage_per_proxy": {self.entries[i]["server"]: c for i, c in self._use_count.items() if i < len(self.entries)},
         }
-        prepare_body = {
-            "action": "next", "messages": [],
-            "model": self.payload_config["model"],
-            "history_and_training_disabled": self.payload_config["history_and_training_disabled"],
-            "fork_from_shared_post": False,
-            "enable_message_followups": False,
-            "force_use_sse": False,
-            "force_use_search": None,
-            "force_paragen": False,
-            "supports_buffering": False,
-            "timezone": self.timezone,
-            "timezone_offset_min": self.timezone_offset,
-            "system_hints": self.payload_config["system_hints"],
-            "is_onboarding_conversation": self.payload_config["is_onboarding_conversation"],
-            "no_auth_ad_preferences": self.payload_config["no_auth_ad_preferences"],
-            "client_prepare_dispatch": self.payload_config["client_prepare_dispatch"],
-            "client_prepare_source": self.payload_config["client_prepare_source"]
-        }
+
+
+PROXY_POOL = ProxyPool()
+
+
+# ============================================================================
+# COOKIES
+# ============================================================================
+def load_cookies(path: Path) -> Dict[str, str]:
+    if not path.exists(): return {}
+    out = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            parts = re.split(r"\s{2,}", line)
+        if len(parts) < 7:
+            toks = line.split()
+            if len(toks) >= 2:
+                n, v = toks[-2], toks[-1]
+                if re.fullmatch(r"[A-Za-z0-9_]+", n): out[n] = v
+            continue
+        n, v = parts[5].strip(), parts[6].strip()
+        if n and v:
+            try: v = unquote(v)
+            except Exception: pass
+            out[n] = v
+    return out
+
+
+def cookie_expiry_info(path: Path) -> Dict[str, Any]:
+    info = {"cookies": {}, "file_exists": False, "file_path": str(path)}
+    if not path.exists(): return info
+    info["file_exists"] = True
+    info["file_mtime"] = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+    info["file_size"] = path.stat().st_size
+    now = time.time()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        parts = line.split("\t")
+        if len(parts) < 7: continue
         try:
-            r = self.session.post(url, headers=headers, json=prepare_body, 
-                                  timeout=25, proxies=self.current_proxy)
-            if r.ok:
-                try:
-                    j = r.json()
-                    if "conduit_token" in j:
-                        self.conduit_token = j["conduit_token"]
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[prepare] {e}")
-
-        # Sentinel
-        url2 = f"{self.base_url}{self.sentinel_path}"
-        headers2 = {
-            **self._common_headers(),
-            "x-openai-target-path": self.sentinel_path,
-            "content-type": "application/json"
-        }
-        try:
-            r = self.session.post(url2, headers=headers2, json={}, 
-                                  timeout=25, proxies=self.current_proxy)
-            if r.ok:
-                try:
-                    j = r.json()
-                    if "token" in j:
-                        self.chat_req_token = j["token"]
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[sentinel] {e}")
-
-    def send_message(self, text, conversation_id=None, parent_id=None, retry=True):
-        url = f"{self.base_url}{self.conversation_path}"
-        sentinel = {
-            "bot_token": {
-                "play_integrity_token": self.play_integrity_token or "",
-                "chat_requirement_token": self.chat_req_token or ""
+            expiry_ts = int(parts[4])
+            name = parts[5].strip()
+            value = parts[6].strip()
+            if expiry_ts == 0:
+                status = "session_only"; days_left = None; expires_at = None
+            elif expiry_ts < now:
+                status = "EXPIRED"
+                days_left = round((expiry_ts - now) / 86400, 2)
+                expires_at = datetime.fromtimestamp(expiry_ts).isoformat()
+            else:
+                days_left = round((expiry_ts - now) / 86400, 2)
+                expires_at = datetime.fromtimestamp(expiry_ts).isoformat()
+                if days_left < 1: status = "expires_soon"
+                elif days_left < 7: status = "expires_this_week"
+                else: status = "valid"
+            masked = value[:6] + "..." + value[-4:] if len(value) > 12 else value[:3] + "..."
+            info["cookies"][name] = {
+                "status": status, "expires_at": expires_at,
+                "days_left": days_left, "value_preview": masked,
+                "value_length": len(value),
             }
-        }
-        headers = {
-            **self._common_headers(),
-            "accept": "text/event-stream,application/json",
-            "cache-control": "no-cache",
-            "x-sentinel-payload": json.dumps(sentinel),
-            "x-conduit-token": self.conduit_token or "",
-            "x-oai-convo-session-id": self.convo_session_id,
-            "x-oai-turn-trace-id": str(uuid.uuid4()),
-            "oai-echo-logs": "1,552,0,822,1,3296,1,5355,0,5533,1,8297,0,8739,1,9818,0,11081,1,12543",
-            "x-openai-target-path": self.conversation_path,
-            "content-type": "application/json"
-        }
+        except Exception:
+            continue
+    return info
 
-        msg_id = str(uuid.uuid4())
-        body = {
-            "action": "next",
-            "messages": [{
-                "id": msg_id,
-                "author": {"role": "user"},
-                "content": {"parts": [text], "content_type": "text"},
-                "status": "finished_successfully",
-                "recipient": "all",
-                "metadata": {
-                    "model_slug": self.payload_config["model"],
-                    "default_model_slug": "auto"
+
+_AUTH_COOKIES = {"sessionid", "ds_user_id", "csrftoken", "mid", "ig_did", "rur"}
+
+def cookies_pw(c: Dict[str, str]) -> List[Dict]:
+    out = []
+    for k, v in c.items():
+        is_auth = k in _AUTH_COOKIES
+        out.append({
+            "name": k, "value": v, "domain": ".instagram.com", "path": "/",
+            "secure": True,
+            "httpOnly": k in ("sessionid", "ds_user_id", "mid", "csrftoken"),
+            "sameSite": "None" if is_auth else "Lax",
+        })
+    return out
+
+
+def cookies_header(c: Dict[str, str]) -> str:
+    return "; ".join(f"{k}={v}" for k, v in c.items())
+
+
+def cookie_init_script(c: Dict[str, str]) -> str:
+    parts = []
+    for k, v in c.items():
+        sv = v.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'try{{document.cookie="{k}={sv}; path=/; domain=.instagram.com";}}catch(e){{}}')
+    return "(() => {" + "".join(parts) + "})();"
+
+
+# ============================================================================
+# CACHE
+# ============================================================================
+class Cache:
+    MAX_MEM_ENTRIES = 200
+    def __init__(self, d: Path, ttl_min: int):
+        self.dir = d
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.ttl = timedelta(minutes=ttl_min)
+        self.mem: Dict[str, tuple] = {}
+        self._hits = 0
+        self._miss = 0
+
+    def _k(self, u): return hashlib.sha256(u.lower().encode()).hexdigest()[:16]
+
+    def get(self, u):
+        k = self._k(u)
+        if k in self.mem:
+            ts, d = self.mem[k]
+            if datetime.now() - datetime.fromtimestamp(ts) < self.ttl:
+                self._hits += 1; return d
+            self.mem.pop(k, None)
+        f = self.dir / f"{k}.json"
+        if f.exists():
+            try:
+                o = json.loads(f.read_text(encoding="utf-8"))
+                at = datetime.fromisoformat(o["_at"])
+                if datetime.now() - at < self.ttl:
+                    if len(self.mem) >= self.MAX_MEM_ENTRIES:
+                        self.mem.pop(next(iter(self.mem)), None)
+                    self.mem[k] = (at.timestamp(), o["data"])
+                    self._hits += 1
+                    return o["data"]
+                f.unlink(missing_ok=True)
+            except Exception: pass
+        self._miss += 1
+        return None
+
+    def set(self, u, d):
+        k = self._k(u)
+        if len(self.mem) >= self.MAX_MEM_ENTRIES:
+            self.mem.pop(next(iter(self.mem)), None)
+        self.mem[k] = (time.time(), d)
+        try:
+            (self.dir / f"{k}.json").write_text(
+                json.dumps({"_at": datetime.now().isoformat(), "data": d}, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception: pass
+
+    def clear(self):
+        self.mem.clear(); self._hits = 0; self._miss = 0
+        for f in self.dir.glob("*.json"):
+            try: f.unlink()
+            except: pass
+
+    def stats(self):
+        return {"mem": len(self.mem), "disk": len(list(self.dir.glob("*.json"))),
+                "hits": self._hits, "miss": self._miss,
+                "ttl_min": int(self.ttl.total_seconds() / 60)}
+
+
+CACHE = Cache(CACHE_DIR, CACHE_TTL_MIN)
+
+
+# ============================================================================
+# FINGERPRINT
+# ============================================================================
+class Fingerprint:
+    def __init__(self):
+        self.ua = random.choice(USER_AGENTS)
+        self.platform = "Win32" if "Windows" in self.ua else "MacIntel"
+        self.locale = "en-US"
+        self.timezone = random.choice(["Asia/Kolkata", "Asia/Dubai", "Europe/London", "America/New_York"])
+        self.cores = random.choice([4, 8, 12])
+        self.mem = random.choice([8, 16])
+        self.screen_w = random.choice([1366, 1440, 1536, 1920])
+        self.screen_h = random.choice([768, 900, 864, 1080])
+        self.scale = random.choice([1, 1, 1.25])
+        self.seed = random.randint(1, 2**31 - 1)
+        try:
+            self.chrome_ver = re.search(r"Chrome/(\d+)", self.ua).group(1)
+        except Exception:
+            self.chrome_ver = "131"
+
+    def viewport(self):
+        return {"width": self.screen_w - random.randint(20, 60),
+                "height": self.screen_h - random.randint(80, 140)}
+
+    def screen_dict(self):
+        return {"width": self.screen_w, "height": self.screen_h}
+
+    def stealth_script(self) -> str:
+        return """
+(() => {
+    const _plat = '%s';
+    const _cores = %d;
+    const _mem = %d;
+    const _seed = %d;
+    const _tz = '%s';
+    const _chrome_ver = '%s';
+    const _sw = %d, _sh = %d;
+
+    let _sd = _seed >>> 0;
+    const rnd = () => { _sd = (_sd * 1664525 + 1013904223) >>> 0; return _sd / 4294967296; };
+
+    const _marked = new WeakSet();
+
+    try {
+        const navProto = Object.getPrototypeOf(navigator);
+        if ('webdriver' in navProto) delete navProto.webdriver;
+        if ('webdriver' in navigator) delete navigator.webdriver;
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+    } catch(e) {}
+
+    const navProps = {
+        platform: _plat, hardwareConcurrency: _cores, deviceMemory: _mem,
+        languages: Object.freeze(['en-US','en']), language: 'en-US',
+        maxTouchPoints: 0, vendor: 'Google Inc.', vendorSub: '',
+        productSub: '20030107', pdfViewerEnabled: true, onLine: true,
+    };
+    for (const [k, v] of Object.entries(navProps)) {
+        try { Object.defineProperty(navigator, k, { get: () => v, configurable: true }); } catch(e) {}
+    }
+
+    try {
+        const uaData = {
+            brands: [
+                { brand: 'Not_A Brand', version: '24' },
+                { brand: 'Chromium', version: _chrome_ver },
+                { brand: 'Google Chrome', version: _chrome_ver },
+            ],
+            mobile: false,
+            platform: _plat === 'Win32' ? 'Windows' : 'macOS',
+        };
+        Object.defineProperty(navigator, 'userAgentData', {
+            get: () => ({
+                ...uaData,
+                getHighEntropyValues: () => Promise.resolve({
+                    ...uaData, architecture: 'x86', bitness: '64',
+                    fullVersionList: [
+                        { brand: 'Not_A Brand', version: '24.0.0.0' },
+                        { brand: 'Chromium', version: _chrome_ver + '.0.0.0' },
+                        { brand: 'Google Chrome', version: _chrome_ver + '.0.0.0' },
+                    ],
+                    model: '', platformVersion: '15.0.0',
+                    uaFullVersion: _chrome_ver + '.0.0.0', wow64: false,
+                }),
+                toJSON: () => uaData,
+            }),
+            configurable: true,
+        });
+    } catch(e) {}
+
+    try {
+        if (!window.chrome) window.chrome = {};
+        window.chrome.runtime = window.chrome.runtime || {
+            OnInstalledReason: { INSTALL: 'install', UPDATE: 'update' },
+            PlatformArch: { X86_64: 'x86-64' },
+            PlatformOs: { WIN: 'win' },
+        };
+        window.chrome.app = window.chrome.app || { getDetails: () => null };
+        window.chrome.csi = () => ({ onloadT: Date.now() - 500, pageT: 500, startE: Date.now() - 500, tran: 15 });
+    } catch(e) {}
+
+    try {
+        const mkMime = (type, suffixes, desc) => ({ type, suffixes, description: desc, enabledPlugin: null });
+        const pdfMime1 = mkMime('application/pdf', 'pdf', 'Portable Document Format');
+        const pdfMime2 = mkMime('text/pdf', 'pdf', 'Portable Document Format');
+        const mkPlugin = (n, f, d, mimes) => {
+            const p = { name: n, filename: f, description: d, length: mimes.length };
+            mimes.forEach((m, i) => { p[i] = m; m.enabledPlugin = p; });
+            p.item = (i) => mimes[i] || null;
+            p.namedItem = (x) => mimes.find(y => y.type === x) || null;
+            return p;
+        };
+        const plugins = [
+            mkPlugin('PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime1, pdfMime2]),
+            mkPlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime1, pdfMime2]),
+            mkPlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime1, pdfMime2]),
+        ];
+        const pluginsArr = Object.assign([], plugins);
+        pluginsArr.item = (i) => plugins[i] || null;
+        pluginsArr.namedItem = (n) => plugins.find(p => p.name === n) || null;
+        Object.defineProperty(navigator, 'plugins', { get: () => pluginsArr, configurable: true });
+        Object.defineProperty(navigator, 'mimeTypes', { get: () => [pdfMime1, pdfMime2], configurable: true });
+    } catch(e) {}
+
+    try {
+        if (navigator.permissions && navigator.permissions.query) {
+            const oQ = navigator.permissions.query;
+            navigator.permissions.query = (p) => Promise.resolve({ state: 'prompt', name: p?.name || '', onchange: null });
+        }
+    } catch(e) {}
+
+    try {
+        const oTD = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function(...a) {
+            try {
+                const ctx = this.getContext('2d');
+                if (ctx && this.width > 0) {
+                    const w = Math.min(this.width, 40), h = Math.min(this.height, 40);
+                    const img = ctx.getImageData(0, 0, w, h);
+                    for (let i = 0; i < img.data.length; i += 4) {
+                        img.data[i] = (img.data[i] + ((rnd() * 3) | 0)) & 0xff;
+                        img.data[i+1] = (img.data[i+1] + ((rnd() * 3) | 0)) & 0xff;
+                    }
+                    ctx.putImageData(img, 0, 0);
                 }
-            }],
-            "model": self.payload_config["model"],
-            "history_and_training_disabled": self.payload_config["history_and_training_disabled"],
-            "enable_message_followups": self.payload_config["enable_message_followups"],
-            "force_use_sse": self.payload_config["force_use_sse"],
-            "force_use_search": self.payload_config["force_use_search"],
-            "force_paragen": self.payload_config["force_paragen"],
-            "supports_buffering": self.payload_config["supports_buffering"],
-            "timezone": self.timezone,
-            "timezone_offset_min": self.timezone_offset,
-            "system_hints": self.payload_config["system_hints"],
-            "is_onboarding_conversation": self.payload_config["is_onboarding_conversation"],
-            "no_auth_ad_preferences": self.payload_config["no_auth_ad_preferences"],
-            "client_prepare_state": self.payload_config["client_prepare_state"],
-            "stream": True
+            } catch(e) {}
+            return oTD.apply(this, a);
+        };
+    } catch(e) {}
+
+    try {
+        const patchGL = (Ctor) => {
+            if (!Ctor) return;
+            const oGP = Ctor.prototype.getParameter;
+            Ctor.prototype.getParameter = function(p) {
+                if (p === 37445 || p === 7936) return 'Google Inc. (Intel)';
+                if (p === 37446 || p === 7937) return 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return oGP.call(this, p);
+            };
+        };
+        patchGL(window.WebGLRenderingContext);
+        patchGL(window.WebGL2RenderingContext);
+    } catch(e) {}
+
+    try {
+        const stub = function() {
+            this.close = () => {};
+            this.createOffer = () => Promise.resolve({ type: 'offer', sdp: '' });
+            this.createAnswer = () => Promise.resolve({ type: 'answer', sdp: '' });
+            this.setLocalDescription = () => Promise.resolve();
+            this.setRemoteDescription = () => Promise.resolve();
+            this.addIceCandidate = () => Promise.resolve();
+            this.getStats = () => Promise.resolve(new Map());
+            this.addEventListener = () => {}; this.removeEventListener = () => {};
+        };
+        window.RTCPeerConnection = stub;
+        window.webkitRTCPeerConnection = stub;
+    } catch(e) {}
+
+    try {
+        if (!navigator.getBattery) {
+            navigator.getBattery = () => Promise.resolve({ charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity });
         }
-        if conversation_id:
-            body["conversation_id"] = conversation_id
-        if parent_id:
-            body["parent_message_id"] = parent_id
+    } catch(e) {}
 
-        # Try both proxies if one fails
-        proxy_to_use = self.current_proxy or get_random_proxy()
-        
+    try {
+        Object.defineProperty(navigator, 'connection', {
+            get: () => ({ downlink: 10, effectiveType: '4g', rtt: 50, saveData: false, onchange: null }),
+            configurable: true,
+        });
+    } catch(e) {}
+
+    try {
+        if (navigator.mediaDevices) {
+            navigator.mediaDevices.enumerateDevices = () => Promise.resolve([
+                { deviceId: 'default', kind: 'audioinput', label: '', groupId: 'default' },
+                { deviceId: 'default', kind: 'videoinput', label: '', groupId: 'default' },
+            ]);
+        }
+    } catch(e) {}
+
+    try {
+        const oBR = Element.prototype.getBoundingClientRect;
+        Element.prototype.getBoundingClientRect = function() {
+            const r = oBR.call(this);
+            if (this.tagName === 'SPAN' && (this.textContent || '').length <= 3) {
+                return new DOMRect(r.x, r.y, r.width + 0.3, r.height);
+            }
+            return r;
+        };
+    } catch(e) {}
+
+    try { Object.defineProperty(Notification, 'permission', { get: () => 'denied', configurable: true }); } catch(e) {}
+
+    try {
+        if (screen.orientation) {
+            Object.defineProperty(screen.orientation, 'angle', { get: () => 0, configurable: true });
+            Object.defineProperty(screen.orientation, 'type', { get: () => 'landscape-primary', configurable: true });
+        }
+        Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
+        Object.defineProperty(screen, 'pixelDepth', { get: () => 24, configurable: true });
+    } catch(e) {}
+
+    try {
+        Object.defineProperty(window, 'outerWidth', { get: () => _sw, configurable: true });
+        Object.defineProperty(window, 'outerHeight', { get: () => _sh, configurable: true });
+    } catch(e) {}
+
+    try {
+        if (window.speechSynthesis) {
+            speechSynthesis.getVoices = () => [
+                { default: true, lang: 'en-US', localService: true, name: 'Microsoft David - English (United States)', voiceURI: 'Microsoft David' },
+                { default: false, lang: 'en-US', localService: true, name: 'Microsoft Zira - English (United States)', voiceURI: 'Microsoft Zira' },
+            ];
+        }
+    } catch(e) {}
+
+    try { if (!navigator.getGamepads) navigator.getGamepads = () => [null, null, null, null]; } catch(e) {}
+    try { if (!navigator.vibrate) navigator.vibrate = () => false; } catch(e) {}
+
+    try {
+        const oNow = performance.now.bind(performance);
+        const off = rnd() * 0.5;
+        performance.now = () => oNow() + off;
+    } catch(e) {}
+
+    try {
+        const offsets = {
+            'Asia/Kolkata': -330, 'Asia/Dubai': -240, 'Europe/London': 0,
+            'America/New_York': 300, 'America/Los_Angeles': 480,
+        };
+        const off = offsets[_tz] !== undefined ? offsets[_tz] : 0;
+        Date.prototype.getTimezoneOffset = () => off;
+    } catch(e) {}
+
+    try {
+        const native = 'function () { [native code] }';
+        const oTS = Function.prototype.toString;
+        Function.prototype.toString = function() {
+            if (_marked.has(this)) return native;
+            const s = oTS.call(this);
+            if (s.includes('playwright') || s.includes('puppeteer')) return native;
+            return s;
+        };
+    } catch(e) {}
+
+    try { document.hasFocus = () => true; } catch(e) {}
+})();
+""" % (self.platform, self.cores, self.mem, self.seed, self.timezone, self.chrome_ver,
+        self.screen_w, self.screen_h)
+
+
+# ============================================================================
+# ROUTE FILTER
+# ============================================================================
+BLOCK_PATTERNS = (
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "facebook.com/tr", "connect.facebook.net", "hotjar.com", "fullstory.com",
+    "sentry.io", "sentry-cdn.com", "amplitude.com", "mixpanel.com",
+    "segment.io", "segment.com", "newrelic.com", "datadoghq.com",
+    "optimizely.com", "criteo.com", "taboola.com", "outbrain.com",
+    "adnxs.com", "pubmatic.com", "clarity.ms", "tiktok.com/i18n/pixel",
+)
+BLOCK_TYPES = {"image", "media", "font"}
+
+
+async def route_filter(route: Route):
+    try:
+        req = route.request
+        if any(b in req.url for b in BLOCK_PATTERNS):
+            await route.abort(); return
+        if req.resource_type in BLOCK_TYPES:
+            await route.abort(); return
+        await route.continue_()
+    except Exception:
+        try: await route.continue_()
+        except: pass
+
+
+# ============================================================================
+# POPUP DISMISS
+# ============================================================================
+POPUP_SELECTORS = [
+    'button:has-text("Not Now")',
+    'button:has-text("Not now")',
+    'button:has-text("Cancel")',
+    'div[role="dialog"] [aria-label="Close"]',
+    '[aria-label="Close"]',
+]
+
+
+async def dismiss_popups(page: Page) -> int:
+    clicked = 0
+    for sel in POPUP_SELECTORS:
         try:
-            r = self.session.post(url, headers=headers, json=body,
-                                  stream=True, timeout=90, 
-                                  proxies=proxy_to_use)
-            
-            # If 403 with current proxy, try the other proxy
-            if r.status_code == 403 and retry:
-                print(f"[retry] 403 with current proxy, trying other...")
-                # Switch proxy
-                self.current_proxy = [p for p in PROXIES if p != proxy_to_use][0]
-                return self.send_message(text, conversation_id, parent_id, False)
-            
-            if r.status_code in (401, 403, 422, 500) and retry:
-                self._init_session()
-                return self.send_message(text, conversation_id, parent_id, False)
-            
-            if not r.ok:
-                return None, None, None, None, f"HTTP {r.status_code}: {r.text[:300]}"
-        except Exception as e:
-            return None, None, None, None, f"Exception: {e}"
-
-        if "x-conduit-token" in r.headers:
-            self.conduit_token = r.headers["x-conduit-token"]
-
-        full_text = ""
-        new_conv = conversation_id
-        new_parent = parent_id
-        model_used = self.payload_config["model"]
-
-        try:
-            for line in r.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data = line[6:]
-                if data == "[DONE]":
-                    break
+            els = await page.query_selector_all(sel)
+            for el in els:
                 try:
-                    ev = json.loads(data)
+                    if await el.is_visible():
+                        await el.click(timeout=400, force=True)
+                        clicked += 1
+                        await page.wait_for_timeout(60)
                 except Exception:
                     continue
-                if ev.get("type") == "resume_conversation_token":
-                    new_conv = ev.get("conversation_id", new_conv)
-                if "message" in ev:
-                    m = ev["message"]
-                    if m.get("author", {}).get("role") == "assistant" and \
-                            m.get("channel") == "final":
-                        new_parent = m.get("id", new_parent)
-                        if "metadata" in m and "model_slug" in m["metadata"]:
-                            model_used = m["metadata"]["model_slug"]
-                        parts = m.get("content", {}).get("parts", [])
-                        if parts:
-                            cur = "".join([p for p in parts if isinstance(p, str)])
-                            if cur != full_text:
-                                full_text = cur
-        except Exception as e:
-            return full_text or None, new_conv, new_parent, model_used, f"Stream: {e}"
-
-        return full_text, new_conv, new_parent, model_used, None
+            if clicked: break
+        except Exception:
+            continue
+    return clicked
 
 
-# ==================== ROUTES ====================
-
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({
-        "status": "ok",
-        "message": "ChatGPT API running",
-        "endpoints": {
-            "ai": "/api/ai?key=FFG&prompt=hi",
-            "health": "/api/health",
-            "session": "/api/session",
-            "proxy_test": "/api/proxy-test"
-        }
-    })
-
-
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
-
-
-@app.route("/api/session", methods=["GET"])
-def session_info():
-    """Show cookie status"""
-    gpt = ChatGPT()
-    return jsonify({
-        "status": "ok",
-        "cookie_status": gpt.cookie_status,
-        "conduit_token": "yes" if gpt.conduit_token else "no",
-        "chat_req_token": "yes" if gpt.chat_req_token else "no",
-        "proxy_used": gpt.current_proxy["http"].split("@")[1] if gpt.current_proxy else "none",
-        "endpoint": "/api/ai?key=FFG&prompt=hi"
-    })
-
-
-@app.route("/api/proxy-test", methods=["GET"])
-def proxy_test():
-    """Test both proxies"""
-    results = []
-    for i, proxy in enumerate(PROXIES):
-        try:
-            r = requests.get("https://chatgpt.com/", timeout=15,
-                           proxies=proxy,
-                           headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-            results.append({
-                "proxy": proxy["http"].split("@")[1],
-                "status": r.status_code,
-                "ok": r.status_code == 200,
-                "server": r.headers.get("server", "none")
-            })
-        except Exception as e:
-            results.append({
-                "proxy": proxy["http"].split("@")[1],
-                "error": str(e)[:100],
-                "ok": False
-            })
-    
-    return jsonify({"results": results})
-
-
-@app.route("/api/ai", methods=["GET"])
-def ai_endpoint():
-    api_key = request.args.get("key", "").strip()
-    prompt = request.args.get("prompt", "").strip()
-    conversation_id = request.args.get("conversation_id", None)
-    parent_id = request.args.get("parent_id", None)
-
-    if not api_key:
-        return jsonify({"status": "error", "message": "Missing key", "reply": None}), 401
-    if api_key != API_KEY:
-        return jsonify({"status": "error", "message": "Invalid key", "reply": None}), 403
-    if not prompt:
-        return jsonify({"status": "error", "message": "Missing prompt", "reply": None}), 400
-
+async def has_session_cookies(ctx: BrowserContext) -> bool:
     try:
-        gpt = ChatGPT()
-        reply, new_cid, new_pid, model, error = gpt.send_message(
-            prompt, conversation_id, parent_id
-        )
+        cookies = await ctx.cookies("https://www.instagram.com/")
+        for c in cookies:
+            if c.get("name") == "ds_user_id" and c.get("value"):
+                return True
+            if c.get("name") == "sessionid" and c.get("value"):
+                return True
+        return False
+    except Exception:
+        return False
 
-        if error:
-            return jsonify({
-                "status": "error",
-                "message": error,
-                "cookie_status": gpt.cookie_status,
-                "proxy_used": gpt.current_proxy["http"].split("@")[1] if gpt.current_proxy else "none",
-                "reply": None
-            }), 500
-        
-        if not reply:
-            return jsonify({"status": "error", "message": "No response", "reply": None}), 500
 
-        return jsonify({
-            "status": "success",
-            "reply": reply,
-            "conversation_id": new_cid,
-            "parent_id": new_pid,
-            "model": model,
-            "proxy_used": gpt.current_proxy["http"].split("@")[1] if gpt.current_proxy else "none"
+# ============================================================================
+# HELPERS
+# ============================================================================
+def year_from_id(uid):
+    ranges = [
+        (0, 100_000, 2008), (100_000, 1_000_000, 2010), (1_000_000, 5_000_000, 2011),
+        (5_000_000, 20_000_000, 2012), (20_000_000, 80_000_000, 2013),
+        (80_000_000, 200_000_000, 2014), (200_000_000, 400_000_000, 2015),
+        (400_000_000, 700_000_000, 2016), (700_000_000, 1_000_000_000, 2017),
+        (1_000_000_000, 2_500_000_000, 2018), (2_500_000_000, 4_500_000_000, 2019),
+        (4_500_000_000, 7_000_000_000, 2020), (7_000_000_000, 10_000_000_000, 2021),
+        (10_000_000_000, 20_000_000_000, 2022), (20_000_000_000, 40_000_000_000, 2023),
+        (40_000_000_000, 60_000_000_000, 2024), (60_000_000_000, 80_000_000_000, 2025),
+        (80_000_000_000, 999_999_999_999, 2026),
+    ]
+    for lo, hi, y in ranges:
+        if lo <= uid < hi: return y
+    return None
+
+
+def parse_count(s):
+    if not s: return None
+    s = str(s).strip().replace(",", "").replace(" ", "")
+    mult = 1
+    if s and s[-1].upper() == "K": mult = 1_000; s = s[:-1]
+    elif s and s[-1].upper() == "M": mult = 1_000_000; s = s[:-1]
+    elif s and s[-1].upper() == "B": mult = 1_000_000_000; s = s[:-1]
+    try: return int(float(s) * mult)
+    except ValueError: return None
+
+
+def upgrade_hd(url):
+    if not url: return url
+    url = re.sub(r"/s\d+x\d+/", "/", url)
+    url = re.sub(r"stp=dst-jpg_s\d+x\d+[^&]*", "stp=dst-jpg", url)
+    url = re.sub(r"stp=dst-jpg_s\d+x\d+_tt\d+&?", "", url)
+    return re.sub(r"&&+", "&", url).replace("?&", "?").rstrip("&").rstrip("?")
+
+
+def profile_url(u): return f"https://www.instagram.com/{u}/?hl=en"
+
+
+def extract_bio_links(bio, ext, api_links=None):
+    links, seen = [], set()
+    def add(url, typ, text=None):
+        if not url or url in seen: return
+        seen.add(url)
+        links.append({"url": url, "display_text": text or (url[:60] + "..." if len(url) > 60 else url),
+            "type": typ, "source": "bio_parser"})
+    for l in (api_links or []):
+        if isinstance(l, dict) and l.get("url"): add(l["url"], "bio_link", l.get("title") or l["url"])
+        elif isinstance(l, str) and l: add(l, "bio_link")
+    if bio:
+        for m in re.findall(r'(?:https?://|www\.)\S+', bio, re.I): add(m.strip('.,!?;'), "url")
+        for m in re.findall(r'\b([a-zA-Z0-9.-]+\.(?:com|net|org|io|co|me|app|ai|dev|info|biz|xyz|link|to|tv)(?:/\S*)?)\b', bio, re.I):
+            if not m.startswith("http") and "instagram" not in m.lower(): add(f"https://{m}", "url", m)
+        for m in re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', bio): add(f"mailto:{m}", "email", m)
+        for m in re.findall(r'@([A-Za-z0-9_.]+)', bio): add(f"https://www.instagram.com/{m}", "mention", f"@{m}")
+        for m in re.findall(r'#([A-Za-z0-9_]+)', bio): add(f"https://www.instagram.com/explore/tags/{m}", "hashtag", f"#{m}")
+    if ext: add(ext, "external_url")
+    return links
+
+
+# ============================================================================
+# TOPSEARCH — 3 RETRIES
+# ============================================================================
+async def fetch_topsearch(page: Page, username: str, max_retries: int = 3) -> Optional[Dict]:
+    """TopSearch with retries — proxy jitter se bachne ke liye."""
+    js_code = r"""(username) => {
+        return fetch(`https://www.instagram.com/web/search/topsearch/?context=user&count=0&query=${encodeURIComponent(username)}`, {
+            headers: {
+                'Accept': 'application/json, text/plain, */*',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-IG-App-ID': '936619743392459',
+            },
+            credentials: 'include'
         })
-    
+        .then(r => {
+            if (!r.ok) return {error: 'http_' + r.status};
+            return r.json();
+        })
+        .then(j => {
+            if (j.error) return {error: j.error};
+            if (!j || !j.users || !Array.isArray(j.users)) return {error: 'no_users'};
+            // Exact match
+            for (const item of j.users) {
+                const u = item.user || item;
+                if (u && u.username && u.username.toLowerCase() === username.toLowerCase()) {
+                    return {user: u};
+                }
+            }
+            // Partial — first result
+            if (j.users.length > 0) {
+                const u = j.users[0].user || j.users[0];
+                if (u && u.username) return {user: u};
+            }
+            return {error: 'no_match'};
+        })
+        .catch(e => ({error: 'fetch_fail'}));
+    }"""
+
+    for attempt in range(max_retries):
+        try:
+            result = await asyncio.wait_for(
+                page.evaluate(js_code, username),
+                timeout=API_TIMEOUT
+            )
+            if result and isinstance(result, dict) and result.get("user"):
+                user = result["user"]
+                # Verify pk exists
+                if user.get("pk") or user.get("id"):
+                    return user
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+        if attempt < max_retries - 1:
+            await page.wait_for_timeout(400)
+
+    return None
+
+
+# ============================================================================
+# DEEP DOM EXTRACTION — v25
+# ============================================================================
+async def extract_dom_deep(page: Page) -> Dict:
+    """Deep DOM extraction — multiple strategies, prioritizes reliability."""
+    try:
+        return await asyncio.wait_for(
+            page.evaluate(r"""() => {
+                const result = {
+                    username: null, full_name: null, biography: null,
+                    followers: null, following: null, posts: null,
+                    is_verified: false, is_private: false,
+                    profile_pic: null, external_url: null,
+                    category_name: null, is_business: false,
+                    bio_links: [],
+                    meta_id: null, meta_desc: null, og_image: null,
+                    title_text: null, has_header: false,
+                };
+
+                // ============ 1. TITLE TAG (most reliable) ============
+                const titleTag = document.querySelector('title');
+                if (titleTag) {
+                    const t = titleTag.textContent || '';
+                    result.title_text = t;
+                    // "Instagram (@instagram) • Instagram photos and videos"
+                    const mUser = /\(@([^)]+)\)/.exec(t);
+                    if (mUser) result.username = mUser[1].trim();
+                    const mName = /^(.+?)\s*\(@/.exec(t);
+                    if (mName && mName[1].trim()) result.full_name = mName[1].trim();
+                    // "No bio available" check
+                }
+
+                // ============ 2. META TAGS ============
+                const getMeta = (prop) => {
+                    const el = document.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`);
+                    return el ? (el.getAttribute('content') || '').trim() : null;
+                };
+                result.og_image = getMeta('og:image');
+                result.meta_desc = getMeta('og:description');
+
+                // og:title fallback
+                const og_title = getMeta('og:title');
+                if (og_title && !result.username) {
+                    const m = /\(@([^)]+)\)/.exec(og_title);
+                    if (m) result.username = m[1].trim();
+                    const m2 = /^(.+?)\s*\(@/.exec(og_title);
+                    if (m2 && m2[1].trim() && !result.full_name) result.full_name = m2[1].trim();
+                }
+
+                // og:url fallback for username
+                const og_url = getMeta('og:url');
+                if (og_url && !result.username) {
+                    const m = /instagram\.com\/([^\/\?]+)/.exec(og_url);
+                    if (m) result.username = m[1];
+                }
+
+                // ============ 3. COUNTS from og:description ============
+                const desc = result.meta_desc || '';
+                const fM = /([\d.,KMB]+)\s+Followers?/i.exec(desc);
+                const gM = /([\d.,KMB]+)\s+Following/i.exec(desc);
+                const pM = /([\d.,KMB]+)\s+Posts?/i.exec(desc);
+                if (fM) result.followers = fM[1];
+                if (gM) result.following = gM[1];
+                if (pM) result.posts = pM[1];
+
+                // Full name from og:description: "from Instagram (@instagram)"
+                if (!result.full_name) {
+                    const mName = /from\s+(.+?)\s*\(@/i.exec(desc);
+                    if (mName && mName[1].trim()) result.full_name = mName[1].trim();
+                }
+
+                // ============ 4. META ID ============
+                const ID_KEYS = ['instapp:owner_user_id', 'instapp:user_id',
+                                 'profile:user_id', 'owner_user_id', 'user_id',
+                                 'og:user:id', 'al:android:url', 'al:ios:url'];
+                for (const m of document.querySelectorAll('meta')) {
+                    const p = (m.getAttribute('property') || m.getAttribute('name') || '').toLowerCase();
+                    const c = (m.getAttribute('content') || '').trim();
+                    if (!c) continue;
+                    for (const k of ID_KEYS) {
+                        if (p === k || p.includes(k)) {
+                            if (/^\d{4,}$/.test(c)) { result.meta_id = c; break; }
+                            const m2 = /[?&]user[_-]?id=(\d{4,})/i.exec(c) || /[?&]id=(\d{4,})/i.exec(c);
+                            if (m2) { result.meta_id = m2[1]; break; }
+                        }
+                    }
+                    if (result.meta_id) break;
+                }
+
+                // ============ 5. HEADER (main container) ============
+                let header = document.querySelector('main header');
+                if (!header) header = document.querySelector('header[role="banner"]');
+                if (!header) {
+                    for (const h of document.querySelectorAll('header, main > div')) {
+                        if (/follower|post/i.test(h.innerText || '')) { header = h; break; }
+                    }
+                }
+
+                if (header) {
+                    result.has_header = true;
+                    const txt = (el) => el ? (el.innerText || '').trim() : null;
+                    const BAD = /^(close friends|following|followers|suggested|notifications|messages|search|home|reels|explore|profile|instagram|verified|official|follow|message|edit profile|subscribe|see translation|more|contact|follow back|following)$/i;
+                    const CNT = /^[\d,.\s]+(followers|following|posts|k|m|b)?$/i;
+                    const NUM = /^[\d,.\s]+$/;
+                    const LET = /[A-Za-z\u0900-\u097F]/;
+
+                    // Username from h2/h1
+                    const uel = header.querySelector('h2, h1');
+                    const hUser = txt(uel);
+                    if (hUser && !result.username) {
+                        result.username = hUser.replace(/^@/, '').trim();
+                    }
+
+                    // Full name — biggest font weight
+                    const names = [];
+                    for (const s of header.querySelectorAll('span[dir="auto"], span')) {
+                        const t = txt(s);
+                        if (!t || t.length > 100 || t.length < 1) continue;
+                        if (t === result.username || BAD.test(t) || t.startsWith('@')) continue;
+                        if (NUM.test(t) || CNT.test(t) || !LET.test(t)) continue;
+                        const st = getComputedStyle(s);
+                        const w = parseInt(st.fontWeight) || 400;
+                        const sz = parseFloat(st.fontSize) || 0;
+                        if (w >= 600 && sz >= 14) names.push({ text: t, score: w * sz, len: t.length });
+                    }
+                    if (names.length) {
+                        names.sort((a, b) => b.score - a.score || b.len - a.len);
+                        result.full_name = names[0].text;
+                    }
+
+                    // Verified badge
+                    for (const svg of header.querySelectorAll('svg')) {
+                        const label = svg.getAttribute('aria-label') || (svg.querySelector('title')?.textContent || '');
+                        if (/verified/i.test(label)) { result.is_verified = true; break; }
+                    }
+
+                    // Counts from <ul><li>
+                    const ul = header.querySelector('ul');
+                    if (ul) {
+                        for (const li of ul.querySelectorAll('li')) {
+                            const t = (li.innerText || '').trim();
+                            const tl = t.toLowerCase();
+                            const m = /([\d.,KMB]+)/.exec(t);
+                            if (!m) continue;
+                            if (tl.includes('follower') && !result.followers) result.followers = m[1];
+                            else if (tl.includes('following') && !result.following) result.following = m[1];
+                            else if (tl.includes('post') && !result.posts) result.posts = m[1];
+                        }
+                    }
+
+                    // Private
+                    if (/this account is private|is private/i.test(header.innerText || '')) {
+                        result.is_private = true;
+                    }
+
+                    // Bio — MULTI-LINE extraction, priority to container with newlines
+                    const bios = [];
+                    for (const s of header.querySelectorAll('section span[dir="auto"], section div[dir="auto"], section > div, h1 + div, h2 + div')) {
+                        const t = txt(s);
+                        if (!t || t.length < 5 || t.length > 800) continue;
+                        if (t === result.full_name || t === result.username) continue;
+                        if (BAD.test(t)) continue;
+                        if (CNT.test(t) || NUM.test(t)) continue;
+                        if (!LET.test(t)) continue;
+                        if (/^[\d.,KMB]+\s+(followers|following|posts)/i.test(t)) continue;
+                        if (/^(https?:\/\/|www\.)/i.test(t) && t.length < 40) continue;
+                        bios.push(t);
+                    }
+                    if (bios.length) {
+                        // Prefer bio with newlines (multi-line bios)
+                        bios.sort((a, b) => {
+                            const aNl = a.split('\n').length;
+                            const bNl = b.split('\n').length;
+                            if (aNl !== bNl) return bNl - aNl;
+                            return b.length - a.length;
+                        });
+                        result.biography = bios[0];
+                    }
+
+                    // If bio still not found, get header text after username line
+                    if (!result.biography) {
+                        const ht = header.innerText || '';
+                        const lines = ht.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+                        for (let i = 0; i < lines.length; i++) {
+                            const l = lines[i];
+                            if (l.length < 5 || l.length > 500) continue;
+                            if (BAD.test(l) || CNT.test(l) || NUM.test(l)) continue;
+                            if (l === result.full_name || l === result.username) continue;
+                            if (!LET.test(l)) continue;
+                            if (/^[\d.,KMB]+\s+(followers|following|posts)/i.test(l)) continue;
+                            result.biography = l;
+                            break;
+                        }
+                    }
+
+                    // Profile pic
+                    const img = header.querySelector('img');
+                    if (img && img.src) result.profile_pic = img.src;
+
+                    // External link
+                    for (const a of header.querySelectorAll('a[href]')) {
+                        const href = a.href || '';
+                        if (href.includes('l.instagram.com') || href.includes('/link/')) {
+                            // Instagram link redirect
+                            try {
+                                const u = new URL(href);
+                                const realUrl = u.searchParams.get('u');
+                                if (realUrl) { result.external_url = decodeURIComponent(realUrl); break; }
+                            } catch(e) {}
+                        }
+                        if (href.startsWith('http') && !href.includes('instagram.com') && !href.includes('facebook.com') && !href.includes('meta.com')) {
+                            result.external_url = href;
+                            break;
+                        }
+                    }
+
+                    // Business category
+                    const catPattern = /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$/;
+                    for (const s of header.querySelectorAll('span, div')) {
+                        const t = txt(s);
+                        if (!t || t.length > 60 || t.length < 3) continue;
+                        if (s.children.length > 0) continue;
+                        if (catPattern.test(t) && !BAD.test(t) && t !== result.full_name && t !== result.username) {
+                            // Could be a category — only if within reasonable bounds
+                            // Skip if it's likely a name
+                            if (t.length < 30) {
+                                result.category_name = t;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // ============ 6. JSON-LD ============
+                for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+                    try {
+                        const j = JSON.parse(s.textContent || '');
+                        if (j && (j.name || j.alternateName)) {
+                            if (!result.full_name && j.name) result.full_name = j.name;
+                            if (!result.username && j.alternateName) result.username = String(j.alternateName).replace(/^@/, '');
+                            if (j.description && !result.biography) result.biography = j.description;
+                            if (j.image && !result.profile_pic) {
+                                result.profile_pic = typeof j.image === 'string' ? j.image : (j.image.url || null);
+                            }
+                            if (j.interactionStatistic) {
+                                for (const stat of j.interactionStatistic) {
+                                    const name = ((stat.interactionType && stat.interactionType['@type']) || stat.interactionType || '').toString().toLowerCase();
+                                    if (name.includes('follow') && stat.userInteractionCount && !result.followers) {
+                                        result.followers = String(stat.userInteractionCount);
+                                    }
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+
+                return result;
+            }"""),
+            timeout=6.0
+        )
+    except (asyncio.TimeoutError, Exception):
+        return {}
+
+
+# ============================================================================
+# PAGE HTML ID FALLBACK
+# ============================================================================
+async def extract_id_from_html(page: Page, username: str) -> Optional[str]:
+    """Regex scan page HTML for user_id — backup if topsearch fails."""
+    try:
+        html = await asyncio.wait_for(page.content(), timeout=5.0)
+        patterns = [
+            rf'"user_id":"(\d{{5,}})"',
+            rf'"user_id":\s*(\d{{5,}})',
+            rf'"pk":"(\d{{5,}})"',
+            rf'"id":"(\d{{5,}})"[^}}]{{0,80}}"username":"{re.escape(username.lower())}"',
+            rf'"username":"{re.escape(username.lower())}"[^}}]{{0,80}}"id":"(\d{{5,}})"',
+            rf'"profile_id":"(\d{{5,}})"',
+        ]
+        for p in patterns:
+            m = re.search(p, html, re.I)
+            if m:
+                uid = m.group(1)
+                if uid.isdigit() and len(uid) >= 5 and int(uid) > 1000:
+                    return uid
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================================
+# PLAYWRIGHT SCRAPE — v25
+# ============================================================================
+async def scrape_with_playwright(username, cookies):
+    url = profile_url(username)
+    out = {
+        "user": None, "dom_data": None, "final_url": url,
+        "error": None, "source": None,
+        "logged_in": None, "cookie_inject_ok": False, "login_wall": False,
+        "popups_dismissed": 0, "duration_ms": 0, "proxy_used": "direct",
+        "topsearch_ok": False, "dom_ok": False, "html_id": None,
+        "header_waited": False, "topsearch_attempts": 0,
+    }
+
+    t_start = time.time()
+
+    proxy = PROXY_POOL.next()
+    out["proxy_used"] = proxy["server"] if proxy else "direct"
+
+    fp = Fingerprint()
+
+    async with BROWSER_SEM:
+        browser = await BROWSER_POOL.acquire_browser()
+
+        ctx_kwargs = dict(
+            user_agent=fp.ua,
+            viewport=fp.viewport(),
+            screen=fp.screen_dict(),
+            locale=fp.locale,
+            timezone_id=fp.timezone,
+            device_scale_factor=fp.scale,
+            extra_http_headers={"Cookie": cookies_header(cookies)},
+            color_scheme=random.choice(["light", "dark"]),
+            has_touch=False,
+            is_mobile=False,
+            java_script_enabled=True,
+            bypass_csp=True,
+            ignore_https_errors=True,
+        )
+        if proxy:
+            ctx_kwargs["proxy"] = proxy
+
+        ctx: BrowserContext = await browser.new_context(**ctx_kwargs)
+
+        try:
+            await ctx.add_init_script(fp.stealth_script())
+            await ctx.add_init_script(cookie_init_script(cookies))
+            await ctx.route("**/*", route_filter)
+
+            page: Page = await ctx.new_page()
+
+            try:
+                # STEP 1: Navigate DIRECTLY to profile (skip homepage — save time)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                except PlaywrightTimeout:
+                    out["error"] = "profile_goto_timeout"
+
+                # STEP 2: Inject cookies (now domain is set)
+                if cookies:
+                    try:
+                        await ctx.add_cookies(cookies_pw(cookies))
+                        out["cookie_inject_ok"] = True
+                    except Exception:
+                        out["cookie_inject_ok"] = False
+
+                # STEP 3: Session check via context
+                await page.wait_for_timeout(200)
+                ds_present = await has_session_cookies(ctx)
+                out["logged_in"] = ds_present
+
+                if not ds_present:
+                    out["login_wall"] = True
+                    out["error"] = "LOGIN_WALL"
+                    out["final_url"] = page.url
+                    out["duration_ms"] = round((time.time() - t_start) * 1000, 2)
+                    return out
+
+                # STEP 4: Wait for header render (critical for bio/verified)
+                try:
+                    await page.wait_for_selector("main header, header[role='banner'], main > div > header", timeout=HEADER_WAIT)
+                    out["header_waited"] = True
+                except PlaywrightTimeout:
+                    out["header_waited"] = False
+                await page.wait_for_timeout(800)
+
+                out["popups_dismissed"] = await dismiss_popups(page)
+
+                # STEP 5: TopSearch with retries
+                ts_user = await fetch_topsearch(page, username, max_retries=3)
+                out["topsearch_attempts"] = 3 if not ts_user else (1 if ts_user else 3)
+                if ts_user:
+                    out["user"] = ts_user
+                    out["topsearch_ok"] = True
+                    out["source"] = "topsearch"
+
+                # STEP 6: Deep DOM extraction
+                dom = await extract_dom_deep(page)
+                if dom and isinstance(dom, dict):
+                    out["dom_data"] = dom
+                    out["dom_ok"] = bool(dom.get("has_header") or dom.get("biography") or dom.get("followers"))
+
+                # STEP 7: If ID still missing, scan HTML
+                ts_id = None
+                if ts_user:
+                    ts_id = ts_user.get("pk") or ts_user.get("id")
+                dom_id = dom.get("meta_id") if dom else None
+
+                if not ts_id and not dom_id:
+                    html_id = await extract_id_from_html(page, username)
+                    if html_id:
+                        out["html_id"] = html_id
+
+                out["final_url"] = page.url
+
+            except PlaywrightTimeout:
+                out["error"] = out["error"] or "timeout"
+            except Exception as e:
+                out["error"] = out["error"] or str(e)[:150]
+            finally:
+                try: await page.close()
+                except: pass
+        finally:
+            try: await ctx.close()
+            except: pass
+            if GC_AGGRESSIVE:
+                gc.collect()
+
+    out["duration_ms"] = round((time.time() - t_start) * 1000, 2)
+    return out
+
+
+# ============================================================================
+# BUILD FINAL
+# ============================================================================
+def build_final(username, pw_out):
+    profile = {
+        "id": None, "username": username, "full_name": "N/A",
+        "biography": "No bio available",
+        "is_private": False, "is_verified": False,
+        "is_business_account": False, "is_professional_account": False,
+        "category_name": None, "business_category_name": None,
+        "profile_pic_url": None, "profile_pic_url_hd": None,
+        "external_url": profile_url(username),
+        "followers": 0, "following": 0, "posts": 0,
+        "account_creation_year": None, "has_highlights": False,
+        "is_joined_recently": False, "bio_links": [],
+    }
+    sources = []
+
+    # ---- 1. TOPSEARCH (highest priority for id/username/full_name/verified/private/pic) ----
+    ts = pw_out.get("user") or {}
+    if ts:
+        sources.append("topsearch")
+        uid = ts.get("pk") or ts.get("id")
+        if uid:
+            try: profile["id"] = str(int(str(uid).strip()))
+            except Exception: profile["id"] = str(uid).strip()
+        if ts.get("username"): profile["username"] = str(ts["username"]).strip()
+        if ts.get("full_name"):
+            fn = str(ts["full_name"]).strip()
+            if fn and not re.fullmatch(r"[\d,\.\s]+", fn):
+                profile["full_name"] = fn
+        if ts.get("profile_pic_url"):
+            pic = upgrade_hd(str(ts["profile_pic_url"]))
+            profile["profile_pic_url"] = pic
+            profile["profile_pic_url_hd"] = pic
+        if ts.get("is_verified") is not None:
+            profile["is_verified"] = bool(ts["is_verified"])
+        if ts.get("is_private") is not None:
+            profile["is_private"] = bool(ts["is_private"])
+
+    # ---- 2. HTML ID fallback ----
+    if not profile["id"] and pw_out.get("html_id"):
+        profile["id"] = str(pw_out["html_id"])
+
+    # ---- 3. DOM data ----
+    dom = pw_out.get("dom_data") or {}
+    if dom:
+        sources.append("dom")
+
+        # ID fallback
+        if not profile["id"] and dom.get("meta_id"):
+            profile["id"] = str(dom["meta_id"])
+
+        # Username fallback
+        if not profile["username"] or profile["username"] == username or profile["username"] == "N/A":
+            if dom.get("username"):
+                profile["username"] = str(dom["username"]).lstrip("@").strip()
+
+        # Full name fallback
+        if profile["full_name"] in (None, "", "N/A"):
+            if dom.get("full_name"):
+                fn = str(dom["full_name"]).strip()
+                if fn and not re.fullmatch(r"[\d,\.\s]+", fn):
+                    profile["full_name"] = fn
+
+        # Bio — high priority
+        if dom.get("biography"):
+            bio = str(dom["biography"]).strip()
+            if bio and len(bio) > 2 and bio != "No bio available":
+                profile["biography"] = bio[:300]
+
+        # Counts
+        for key in ("followers", "following", "posts"):
+            if profile.get(key, 0) == 0:
+                val = dom.get(key)
+                if val:
+                    parsed = parse_count(val)
+                    if parsed is not None and parsed > 0:
+                        profile[key] = parsed
+
+        # Verified
+        if not profile["is_verified"] and dom.get("is_verified"):
+            profile["is_verified"] = True
+
+        # Private
+        if dom.get("is_private"):
+            profile["is_private"] = True
+
+        # Pic fallback
+        if not profile["profile_pic_url"]:
+            pic = dom.get("profile_pic") or dom.get("og_image")
+            if pic:
+                hd = upgrade_hd(pic)
+                profile["profile_pic_url"] = hd
+                profile["profile_pic_url_hd"] = hd
+
+        # External URL
+        if dom.get("external_url"):
+            ext = str(dom["external_url"]).strip()
+            if ext and not ext.startswith("https://www.instagram.com/" + username):
+                profile["external_url"] = ext
+
+        # Category
+        if dom.get("category_name"):
+            profile["category_name"] = str(dom["category_name"]).strip()[:80]
+
+        if dom.get("is_business"):
+            profile["is_business_account"] = True
+
+        # Bio links from DOM
+        if isinstance(dom.get("bio_links"), list):
+            for link in dom["bio_links"]:
+                if isinstance(link, str) and link:
+                    profile["bio_links"].append({
+                        "url": link, "display_text": link[:60],
+                        "type": "bio_link", "source": "dom",
+                    })
+
+    # ---- 4. Post-processing ----
+    if profile.get("id") and not profile.get("account_creation_year"):
+        try:
+            n = int(profile["id"])
+            profile["account_creation_year"] = year_from_id(n)
+            profile["is_joined_recently"] = (year_from_id(n) or 0) >= 2024
+        except Exception: pass
+
+    # Ensure external_url is correct
+    final_uname = profile.get("username") or username
+    profile["external_url"] = profile["external_url"] if profile["external_url"] != profile_url(username) else profile_url(final_uname)
+
+    # Pic upgrade
+    pic = profile.get("profile_pic_url_hd") or profile.get("profile_pic_url")
+    if pic:
+        pic = upgrade_hd(pic)
+        profile["profile_pic_url"] = pic
+        profile["profile_pic_url_hd"] = pic
+
+    # Full name sanity
+    if profile.get("full_name") and re.fullmatch(r"[\d,\.\s]+", str(profile["full_name"])):
+        profile["full_name"] = "N/A"
+
+    # Bio links — dedupe
+    if not isinstance(profile.get("bio_links"), list):
+        profile["bio_links"] = []
+    seen_urls = set()
+    unique_links = []
+    for l in profile["bio_links"]:
+        if isinstance(l, dict):
+            u = l.get("url")
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                unique_links.append(l)
+    profile["bio_links"] = unique_links
+
+    # Add external_url to bio_links if not present
+    if profile.get("external_url"):
+        ext = profile["external_url"]
+        if ext not in seen_urls and not ext.startswith("https://www.instagram.com/" + final_uname):
+            profile["bio_links"].insert(0, {
+                "url": ext, "display_text": ext[:60],
+                "type": "external_url", "source": "dom",
+            })
+
+    # Ensure all keys
+    keys = ["id","username","full_name","biography","is_private","is_verified",
+            "is_business_account","is_professional_account","category_name",
+            "business_category_name","profile_pic_url","profile_pic_url_hd",
+            "external_url","followers","following","posts",
+            "account_creation_year","has_highlights","is_joined_recently","bio_links"]
+    for k in keys:
+        profile.setdefault(k, None)
+    for k in ("followers","following","posts"):
+        if profile.get(k) is None: profile[k] = 0
+
+    source_str = "+".join(sources) if sources else "failed"
+
+    return {
+        "status": "success" if (profile.get("id") and profile.get("username")) else "error",
+        "source": source_str,
+        "final_url": profile_url(final_uname),
+        "profile": profile,
+    }
+
+
+# ============================================================================
+# FASTAPI
+# ============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[boot] proxies={PROXY_POOL.size()} cache_ttl={CACHE_TTL_MIN}m "
+          f"browsers={MAX_CONCURRENT_BROWSERS} page={PAGE_TIMEOUT}ms api={int(API_TIMEOUT*1000)}ms")
+    try:
+        await BROWSER_POOL.start()
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e), "reply": None}), 500
+        print(f"[boot] browser warmup failed: {e}")
+    yield
+    await BROWSER_POOL.shutdown()
+    gc.collect()
+
+
+app = FastAPI(title="IG Profile API", version="25.0", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def _public_profile(profile: Dict) -> Dict:
+    return {
+        "id": profile.get("id"),
+        "username": profile.get("username"),
+        "full_name": profile.get("full_name"),
+        "biography": profile.get("biography"),
+        "is_private": profile.get("is_private", False),
+        "is_verified": profile.get("is_verified", False),
+        "is_business_account": profile.get("is_business_account", False),
+        "is_professional_account": profile.get("is_professional_account", False),
+        "category_name": profile.get("category_name"),
+        "business_category_name": profile.get("business_category_name"),
+        "profile_pic_url": profile.get("profile_pic_url"),
+        "profile_pic_url_hd": profile.get("profile_pic_url_hd"),
+        "external_url": profile.get("external_url"),
+        "followers": profile.get("followers", 0),
+        "following": profile.get("following", 0),
+        "posts": profile.get("posts", 0),
+        "account_creation_year": profile.get("account_creation_year"),
+        "has_highlights": profile.get("has_highlights", False),
+        "is_joined_recently": profile.get("is_joined_recently", False),
+        "bio_links": profile.get("bio_links", []),
+    }
+
+
+@app.get("/")
+async def home():
+    return {
+        "service": "Instagram Info API",
+        "version": "25.0.0",
+        "endpoints": {
+            "profile": "/api/profile/key={api_key}/username={username}",
+            "health": "/health/key={health_key}",
+            "cache_stats": "/cache/stats/key={api_key}",
+            "cache_clear": "/cache/clear/key={api_key}",
+        },
+        "credit": {"username": "@KINGFFAIAK47x", "made_by": "ANSH AFT"}
+    }
+
+
+@app.get("/health/key={api_key}")
+async def health_check(api_key: str):
+    if api_key != HEALTH_KEY:
+        raise HTTPException(status_code=401, detail="Invalid health key")
+
+    t0 = time.time()
+    cookie_info = cookie_expiry_info(COOKIE_FILE)
+    cookies = load_cookies(COOKIE_FILE)
+
+    critical = ["sessionid", "ds_user_id", "csrftoken", "mid", "ig_did"]
+    critical_status = {}
+    for c in critical:
+        if c in cookies:
+            info = cookie_info["cookies"].get(c, {})
+            critical_status[c] = {"present": True, "status": info.get("status", "unknown"),
+                                  "days_left": info.get("days_left"), "expires_at": info.get("expires_at")}
+        else:
+            critical_status[c] = {"present": False, "status": "MISSING"}
+
+    cache_stats = CACHE.stats()
+    browser_stats = BROWSER_POOL.stats()
+    proxy_stats = PROXY_POOL.stats()
+    uptime = time.time() - SERVER_START_TIME
+
+    memory_info = {}
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        memory_info = {"rss_mb": round(mem.rss / (1024 * 1024), 2),
+                       "vms_mb": round(mem.vms / (1024 * 1024), 2),
+                       "percent": round(proc.memory_percent(), 2)}
+    except ImportError:
+        memory_info = {"note": "install psutil"}
+
+    live_test = {"tested": False}
+    try:
+        test_out = await scrape_with_playwright("instagram", cookies)
+        ts = test_out.get("user") or {}
+        dom = test_out.get("dom_data") or {}
+
+        live_test = {
+            "tested": True,
+            "login_detected": test_out.get("logged_in"),
+            "cookie_inject_ok": test_out.get("cookie_inject_ok"),
+            "login_wall": test_out.get("login_wall"),
+            "header_waited": test_out.get("header_waited"),
+            "topsearch_ok": test_out.get("topsearch_ok", False),
+            "dom_ok": test_out.get("dom_ok", False),
+            "html_id_fallback": test_out.get("html_id"),
+            "final_source": test_out.get("source"),
+
+            "topsearch_fields": {
+                "id": ts.get("pk") or ts.get("id"),
+                "username": ts.get("username"),
+                "full_name": ts.get("full_name"),
+                "is_verified": ts.get("is_verified"),
+                "is_private": ts.get("is_private"),
+                "has_pic": bool(ts.get("profile_pic_url")),
+            } if ts else None,
+
+            "dom_fields": {
+                "has_header": dom.get("has_header"),
+                "username": dom.get("username"),
+                "full_name": dom.get("full_name"),
+                "biography": (dom.get("biography") or "")[:150] if dom.get("biography") else None,
+                "followers": dom.get("followers"),
+                "following": dom.get("following"),
+                "posts": dom.get("posts"),
+                "is_verified": dom.get("is_verified"),
+                "is_private": dom.get("is_private"),
+                "has_pic": bool(dom.get("profile_pic") or dom.get("og_image")),
+                "meta_id": dom.get("meta_id"),
+                "external_url": dom.get("external_url"),
+                "category": dom.get("category_name"),
+                "title_text": (dom.get("title_text") or "")[:100] if dom.get("title_text") else None,
+                "og_desc": (dom.get("meta_desc") or "")[:150] if dom.get("meta_desc") else None,
+            } if dom else None,
+
+            "popups_dismissed": test_out.get("popups_dismissed"),
+            "duration_ms": test_out.get("duration_ms"),
+            "proxy_used": test_out.get("proxy_used"),
+            "error": test_out.get("error"),
+        }
+    except Exception as e:
+        live_test = {"tested": True, "error": str(e)[:200]}
+
+    elapsed = round(time.time() - t0, 3)
+
+    return {
+        "status": "healthy",
+        "response_time": f"{elapsed}s",
+        "server": {
+            "version": "25.0.0",
+            "uptime_seconds": round(uptime, 2),
+            "uptime_human": str(timedelta(seconds=int(uptime))),
+            "python_version": sys.version.split()[0],
+            "started_at": datetime.fromtimestamp(SERVER_START_TIME).isoformat(),
+            "page_timeout_ms": PAGE_TIMEOUT,
+            "api_timeout_ms": int(API_TIMEOUT * 1000),
+            "header_wait_ms": HEADER_WAIT,
+        },
+        "metrics": REQUEST_COUNTER,
+        "last_scrape": LAST_SCRAPE,
+        "memory": memory_info,
+        "cookies": {
+            "file_path": cookie_info["file_path"],
+            "file_exists": cookie_info["file_exists"],
+            "file_mtime": cookie_info.get("file_mtime"),
+            "file_size": cookie_info.get("file_size"),
+            "total_cookies": len(cookie_info["cookies"]),
+            "critical_cookies": critical_status,
+            "all_cookies": cookie_info["cookies"],
+        },
+        "cache": cache_stats,
+        "browser_pool": browser_stats,
+        "proxy_pool": proxy_stats,
+        "live_test": live_test,
+        "credit": {"username": "@KINGFFAIAK47x", "made_by": "ANSH AFT"}
+    }
+
+
+@app.get("/cache/stats/key={api_key}")
+async def cache_stats_endpoint(api_key: str):
+    if api_key not in VALID_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return {"status": "success", "cache": CACHE.stats()}
+
+
+@app.get("/cache/clear/key={api_key}")
+async def cache_clear_endpoint(api_key: str):
+    if api_key not in VALID_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    CACHE.clear()
+    gc.collect()
+    return {"status": "cleared"}
+
+
+@app.get("/api/profile/key={api_key}/username={username}")
+async def get_profile(api_key: str, username: str):
+    t0 = time.time()
+    REQUEST_COUNTER["total"] += 1
+
+    if api_key not in VALID_KEYS:
+        REQUEST_COUNTER["failed"] += 1
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    username = username.strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9._]+", username):
+        REQUEST_COUNTER["failed"] += 1
+        raise HTTPException(status_code=400, detail="invalid username")
+
+    cached = CACHE.get(username)
+    if cached:
+        profile = cached.get("profile") or {}
+        elapsed = round(time.time() - t0, 3)
+        REQUEST_COUNTER["success"] += 1
+        REQUEST_COUNTER["cached"] += 1
+        return {
+            "status": "success",
+            "response_time": f"{elapsed}s",
+            "username": profile.get("username", username),
+            "final_url": cached.get("final_url", f"https://www.instagram.com/{username}/?hl=en"),
+            "profile": _public_profile(profile),
+            "credit": {"username": "@KINGFFAIAK47x", "made_by": "ANSH AFT"}
+        }
+
+    cookies = load_cookies(COOKIE_FILE)
+    try:
+        pw_out = await scrape_with_playwright(username, cookies)
+    except Exception as e:
+        REQUEST_COUNTER["failed"] += 1
+        raise HTTPException(status_code=500, detail=f"scrape failed: {str(e)[:200]}")
+
+    final = build_final(username, pw_out)
+    profile = final.get("profile") or {}
+
+    if profile.get("id") and profile.get("username"):
+        CACHE.set(username, final)
+
+    LAST_SCRAPE["time"] = datetime.now().isoformat()
+    LAST_SCRAPE["username"] = username
+    LAST_SCRAPE["duration"] = pw_out.get("duration_ms")
+    LAST_SCRAPE["source"] = final.get("source")
+
+    elapsed = round(time.time() - t0, 3)
+
+    if profile.get("id"):
+        REQUEST_COUNTER["success"] += 1
+    else:
+        REQUEST_COUNTER["failed"] += 1
+
+    return {
+        "status": "success" if profile.get("id") else "error",
+        "response_time": f"{elapsed}s",
+        "username": profile.get("username", username),
+        "final_url": final.get("final_url"),
+        "profile": _public_profile(profile),
+        "credit": {"username": "@KINGFFAIAK47x", "made_by": "ANSH AFT"}
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="warning")
